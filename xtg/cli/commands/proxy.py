@@ -63,7 +63,7 @@ def list_proxies(
                     entry.name,
                     str(entry.type),
                     entry.endpoint,
-                    "yes" if entry.has_auth else "no",
+                    "secret" if entry.has_secret else ("yes" if entry.has_auth else "no"),
                     _health_of(manager, entry),
                 )
                 for entry in entries
@@ -90,7 +90,11 @@ def check(
     concurrency: int = typer.Option(20, "--concurrency", min=1, max=200),
     json_output: bool = typer.Option(False, "--json", help="Machine readable output."),
 ) -> None:
-    """Test whether proxies are reachable (TCP connect)."""
+    """Test whether proxies can serve Telegram traffic.
+
+    Classical proxies are checked with a TCP connect; MTProto proxies must also
+    complete an obfuscated handshake, so an open port alone is not enough.
+    """
     manager = get_app_context(ctx).proxies
     if not manager.entries:
         output.warn("The proxy list is empty - nothing to check.")
@@ -123,10 +127,15 @@ def check(
             )
         )
         alive = sum(1 for result in results if result.alive)
-        output.info(f"{alive}/{len(results)} proxies reachable.")
+        output.info(f"{alive}/{len(results)} proxies usable.")
 
-    if not any(result.alive for result in results):
-        raise typer.Exit(code=ExitCode.NETWORK)
+    if any(result.alive for result in results):
+        return
+    # Distinguish "nothing listens there" from "the entries themselves are wrong":
+    # a list made of invalid or unsupported entries is a configuration problem.
+    if any(result.status in ("invalid", "unsupported") for result in results):
+        raise typer.Exit(code=ExitCode.CONFIG_ERROR)
+    raise typer.Exit(code=ExitCode.NETWORK)
 
 
 @app.command("status")
@@ -177,7 +186,7 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
 def show(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Proxy name."),
-    reveal: bool = typer.Option(False, "--reveal", help="Show the password in clear text."),
+    reveal: bool = typer.Option(False, "--reveal", help="Show the password/secret in clear text."),
 ) -> None:
     """Show a single proxy in detail."""
     entry = get_app_context(ctx).proxies.get(name)
@@ -189,6 +198,7 @@ def show(
             "port": entry.port,
             "username": entry.username or "-",
             "password": (entry.password if reveal else mask_secret(entry.password)) or "-",
+            "secret": (entry.secret if reveal else mask_secret(entry.secret)) or "-",
             "url": entry.url if reveal else entry.masked_url,
         },
         title=f"Proxy {entry.name}",

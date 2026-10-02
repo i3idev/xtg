@@ -227,10 +227,10 @@ xtg auth logout        # delete the local session files
 
 ```bash
 xtg proxy list                 # table of the parsed list
-xtg proxy check                # TCP availability check of every proxy
+xtg proxy check                # availability check of every proxy
 xtg proxy check P1 P2          # only selected proxies
 xtg proxy status               # configuration + health counters
-xtg proxy show P3              # detail view (password masked, use --reveal)
+xtg proxy show P3              # detail view (password/secret masked, use --reveal)
 ```
 
 The list file is `xtg/proxy/list_proxy.json`:
@@ -239,15 +239,25 @@ The list file is `xtg/proxy/list_proxy.json`:
 {
   "proxys": {
     "P1": "socks5://host:port",
-    "P2": "socks5://user:pass@host:port"
+    "P2": "socks5://user:pass@host:port",
+    "P3": "tg://proxy?server=host.tld&port=443&secret=base64secret"
   }
 }
 ```
 
 Accepted entry formats: `socks5://host:port`, `http://host:port`,
-`host:port:user:pass` and `host:port`. Entries without a scheme are treated as
-SOCKS5. Invalid entries are reported by `xtg proxy list` instead of aborting
-the run.
+`host:port:user:pass`, `host:port` and the Telegram MTProto URI
+`tg://proxy?server=…&port=…&secret=…`. Entries without a scheme are treated as
+SOCKS5. MTProto entries keep their `server`, `port` and `secret` separately and
+the secret is masked everywhere except the canonical `url` used to write the
+list file back. Invalid entries are reported by `xtg proxy list` instead of
+aborting the run.
+
+`xtg proxy check` connects with TCP for the classical schemes. An MTProto proxy
+is only reported as `alive` when it also answers an obfuscated handshake, so an
+open port alone is never treated as a working proxy. Statuses are `alive`,
+`dead` (nothing listening or the handshake failed), `invalid` (cannot work as
+configured, e.g. a missing secret), `unsupported` (unknown scheme) and `error`.
 
 ### `xtg db`
 

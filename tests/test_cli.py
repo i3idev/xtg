@@ -44,6 +44,31 @@ def cli() -> Any:
     return app
 
 
+@pytest.fixture
+def hermetic_proxies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the CLI at a fixed proxy list instead of the shipped package data.
+
+    ``xtg/proxy/list_proxy.json`` is user-editable sample data, so tests must not
+    assert on its contents.
+    """
+    path = tmp_path / "cli_list_proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "proxys": {
+                    "P1": "socks5://127.0.0.1:1080",
+                    "P2": "socks5://user:pass@127.0.0.1:1081",
+                    "P3": "http://user:pass@127.0.0.1:8082",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XTG_PROXY_FILE", str(path))
+    reload_settings()
+    return path
+
+
 def test_error_boundary_maps_exit_codes() -> None:
     """The console script boundary turns XTGError into a documented exit code."""
     command = get_cli()
@@ -116,29 +141,29 @@ def test_auth_logout_without_session(cli: Any) -> None:
     assert result.exit_code == 0
 
 
-def test_proxy_status_json(cli: Any) -> None:
+def test_proxy_status_json(cli: Any, hermetic_proxies: Path) -> None:
     result = runner.invoke(cli, ["proxy", "status", "--json"])
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["file"].endswith("list_proxy.json")
-    assert payload["stats"]["valid"] == 5
+    assert payload["file"] == str(hermetic_proxies)
+    assert payload["stats"]["valid"] == 3
 
 
-def test_proxy_list(cli: Any) -> None:
+def test_proxy_list(cli: Any, hermetic_proxies: Path) -> None:
     result = runner.invoke(cli, ["proxy", "list"])
     assert result.exit_code == 0
     assert "P1" in result.output
     assert "socks5" in result.output
 
 
-def test_proxy_show_masks_password(cli: Any) -> None:
+def test_proxy_show_masks_password(cli: Any, hermetic_proxies: Path) -> None:
     result = runner.invoke(cli, ["proxy", "show", "P3"])
     assert result.exit_code == 0
     assert "password" in result.output
     assert "***" in result.output or "**" in result.output
 
 
-def test_proxy_show_unknown_name(cli: Any) -> None:
+def test_proxy_show_unknown_name(cli: Any, hermetic_proxies: Path) -> None:
     result = runner.invoke(cli, ["proxy", "show", "NOPE"])
     assert result.exit_code == 7
 
