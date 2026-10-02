@@ -61,7 +61,7 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
         "session_mode": info.mode,
         "session_locked": info.locked,
         "state": telegram_auth.auth_state(settings),
-        "authorized": bool(files) and settings.has_api_credentials,
+        "authorized": info.valid and settings.has_api_credentials,
     }
     if json_output:
         output.emit_json(payload)
@@ -85,6 +85,9 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
         output.hint(f"Set XTG_API_ID and XTG_API_HASH in {settings.env_file} (see .env.example).")
     elif not files:
         output.hint("No session found yet - run `xtg auth login`.")
+    elif not info.valid:
+        output.warn(f"{info.path.name} is not a Telegram session file.")
+        output.hint("Run `xtg auth logout` then `xtg auth login` to rebuild it.")
     elif info.locked:
         output.warn("The session is in use by another xtg process.")
     if files:
@@ -171,7 +174,12 @@ def logout(
 
 
 class _ScriptedPrompter:
-    """Prompter that uses command line options when provided, else asks."""
+    """Prompter that uses command line options when provided, else asks.
+
+    Every prompt is guarded the same way: Ctrl-C, EOF or a closed stdin means
+    the operator cancelled, and that must surface as a clean documented exit
+    code rather than a Click abort with exit status 1.
+    """
 
     def __init__(self, *, phone: str | None, code: str | None, password: str | None) -> None:
         self._phone = phone
@@ -179,22 +187,26 @@ class _ScriptedPrompter:
         self._password = password
         self.cli = CliPrompter()
 
-    def phone(self) -> str:
-        return self._phone if self._phone is not None else self.cli.phone()
-
-    def code(self) -> str:
-        return self._code if self._code is not None else self.cli.code()
-
-    def password(self) -> str:
-        if self._password is not None:
-            return self._password
+    def _ask(self, value: str | None, prompt: str, *, what: str) -> str:
+        if value is not None:
+            return value
         try:
-            return self.cli.password()
+            return getattr(self.cli, prompt)()
         except (typer.Abort, EOFError, KeyboardInterrupt) as exc:
             raise AuthError(
-                "No 2FA password provided",
-                hint="Re-run `xtg auth login` and enter the cloud password.",
+                f"No {what} provided",
+                hint="Re-run `xtg auth login` and answer the prompts, "
+                "or pass --phone/--code/--password.",
             ) from exc
+
+    def phone(self) -> str:
+        return self._ask(self._phone, "phone", what="phone number")
+
+    def code(self) -> str:
+        return self._ask(self._code, "code", what="login code")
+
+    def password(self) -> str:
+        return self._ask(self._password, "password", what="2FA password")
 
 
 def _file_row(path: Path) -> tuple[str, str, str]:

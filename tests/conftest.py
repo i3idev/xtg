@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,26 @@ import pytest
 from xtg.core.config import Settings, reload_settings
 from xtg.database.db import Database
 from xtg.proxy.manager import ProxyManager
+
+#: Every environment variable this project reads. Real variables outrank the
+#: ``.env`` file, which is correct in production but means a developer shell
+#: that exported the project's own ``.env`` silently configures the whole test
+#: suite - with real credentials. ``XTG_`` is the settings prefix; ``REDDIT_``
+#: covers the unprefixed aliases the Reddit fields also accept.
+CONFIG_ENV_PREFIXES = ("XTG_", "REDDIT_")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_config(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Strip the project's own environment variables around every test.
+
+    Tests declare the configuration they need explicitly, so the ambient copy
+    is removed once here, for every test, rather than patched out one test at a
+    time. ``monkeypatch`` restores the variables on teardown.
+    """
+    for name in [name for name in os.environ if name.startswith(CONFIG_ENV_PREFIXES)]:
+        monkeypatch.delenv(name, raising=False)
+    yield
 
 
 @pytest.fixture(autouse=True)

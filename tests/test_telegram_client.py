@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 from tests.fakes import FakeClient
 from xtg.core.config import Settings
 from xtg.core.errors import AuthError, ConfigError, ProxyError
 from xtg.proxy.manager import ProxyManager
-from xtg.proxy.parser import parse_proxy_url
+from xtg.proxy.parser import ProxyEntry, parse_proxy_url
 from xtg.telegram.client import (
     ClientOptions,
     TelegramConnection,
@@ -125,6 +129,228 @@ def test_proxy_error_propagates(tmp_path: Path, proxy_file: Path) -> None:
     manager = ProxyManager.from_settings(settings)
     with pytest.raises(ProxyError):
         manager.get("P9")
+
+
+# --- MTProto proxies --------------------------------------------------------
+
+HEX_SECRET = "0102030405060708090a0b0c0d0e0f10"
+
+
+def mtproto(name: str, secret: str) -> Any:
+    return parse_proxy_url(name, f"tg://proxy?server=1.2.3.4&port=443&secret={secret}")
+
+
+def test_mtproto_secret_is_decoded_for_the_generic_mapping() -> None:
+    payload = to_telethon_proxy(mtproto("P1", HEX_SECRET))
+    assert payload == {
+        "proxy_type": "mtproto",
+        "addr": ("1.2.3.4", 443),
+        "password": bytes.fromhex(HEX_SECRET),
+    }
+
+
+def test_mtproto_translation_accepts_hex_secrets() -> None:
+    entry = mtproto("P1", HEX_SECRET)
+    assert to_telethon_proxy(entry)["password"] == bytes.fromhex(HEX_SECRET)
+
+
+def test_mtproto_translation_rejects_fake_tls_secret() -> None:
+    with pytest.raises(ConfigError, match="fake-tls"):
+        to_telethon_proxy(mtproto("P1", f"ee{HEX_SECRET}"))
+
+
+def test_mtproto_translation_rejects_unusable_secret() -> None:
+    with pytest.raises(ConfigError, match="unusable secret"):
+        to_telethon_proxy(mtproto("P1", "AAAA"))
+
+
+def test_mtproto_translation_requires_secret() -> None:
+    entry = ProxyEntry(name="P1", scheme="mtproto", host="1.2.3.4", port=443)
+    with pytest.raises(ConfigError, match="no secret"):
+        to_telethon_proxy(entry)
+
+
+def test_dd_secrets_are_accepted() -> None:
+    """Telethon implements the randomized intermediate transport; we must not block it.
+
+    Regression: ``dd`` secrets were rejected even though the client selects the
+    very codec they require, so those proxies could never be used.
+    """
+    entry = mtproto("P1", f"dd{HEX_SECRET}")
+    assert to_telethon_proxy(entry)["password"] == bytes.fromhex(HEX_SECRET)
+
+
+@pytest.fixture
+def telethon_network(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Stub ``telethon.network.connection`` so the mapping can be asserted.
+
+    Telethon is an optional runtime dependency; the translation is pure logic,
+    so it is tested against a stand-in with the same class names.
+    """
+    network = types.ModuleType("telethon.network.connection")
+    network.ConnectionTcpMTProxyIntermediate = type("ConnectionTcpMTProxyIntermediate", (), {})
+    network.ConnectionTcpMTProxyRandomizedIntermediate = type(
+        "ConnectionTcpMTProxyRandomizedIntermediate", (), {}
+    )
+    telethon = types.ModuleType("telethon")
+    telethon_network = types.ModuleType("telethon.network")
+    telethon_network.connection = network
+    telethon.network = telethon_network
+    monkeypatch.setitem(sys.modules, "telethon", telethon)
+    monkeypatch.setitem(sys.modules, "telethon.network", telethon_network)
+    monkeypatch.setitem(sys.modules, "telethon.network.connection", network)
+    return network
+
+
+def test_as_kwargs_uses_the_tuple_for_mtproto(telethon_network: Any) -> None:
+    """MTProto needs ``(host, port, secret)``, not the generic mapping."""
+    options = ClientOptions(
+        session=Path("s"), api_id=1, api_hash="h", proxy=mtproto("P1", HEX_SECRET)
+    )
+    kwargs = options.as_kwargs()
+
+    assert kwargs["proxy"] == ("1.2.3.4", 443, HEX_SECRET)
+    assert kwargs["connection"] is telethon_network.ConnectionTcpMTProxyIntermediate
+
+
+def test_as_kwargs_picks_the_codec_the_secret_requires(telethon_network: Any) -> None:
+    options = ClientOptions(
+        session=Path("s"), api_id=1, api_hash="h", proxy=mtproto("P1", f"dd{HEX_SECRET}")
+    )
+    assert (
+        options.as_kwargs()["connection"]
+        is telethon_network.ConnectionTcpMTProxyRandomizedIntermediate
+    )
+
+
+def test_as_kwargs_leaves_classical_proxies_untouched(telethon_network: Any) -> None:
+    options = ClientOptions(
+        session=Path("s"), api_id=1, api_hash="h", proxy=parse_proxy_url("P", "socks5://h:1")
+    )
+    kwargs = options.as_kwargs()
+
+    assert kwargs["proxy"] == {"proxy_type": "socks5", "addr": ("h", 1)}
+    assert "connection" not in kwargs
+
+
+def test_direct_connection_never_gets_a_connection_class() -> None:
+    options = ClientOptions(session=Path("s"), api_id=1, api_hash="h")
+    assert "connection" not in options.as_kwargs()
+
+
+def test_missing_telethon_is_reported_not_swallowed(
+    telethon_network: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing Telethon must raise, never return a half-built proxy mapping."""
+    monkeypatch.setitem(sys.modules, "telethon.network", None)
+    options = ClientOptions(
+        session=Path("s"), api_id=1, api_hash="h", proxy=mtproto("P1", HEX_SECRET)
+    )
+    with pytest.raises(ConfigError, match="Telethon is not installed"):
+        options.as_kwargs()
+
+
+# --- proxy failover ---------------------------------------------------------
+
+
+def broken_and_working_list(tmp_path: Path) -> Path:
+    path = tmp_path / "broken_list.json"
+    path.write_text(
+        json.dumps(
+            {
+                "proxys": {
+                    "BAD": "tg://proxy?server=1.2.3.4&port=443&secret=AAAA",
+                    "TLS": f"tg://proxy?server=1.2.3.4&port=443&secret=ee{HEX_SECRET}",
+                    "OK": f"tg://proxy?server=5.6.7.8&port=443&secret={HEX_SECRET}",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_unusable_proxies_do_not_abort_the_connection(tmp_path: Path) -> None:
+    """Regression: one malformed entry used to kill ``xtg auth login`` outright."""
+    settings = configured(
+        tmp_path, proxy_enabled=True, proxy_file=broken_and_working_list(tmp_path)
+    )
+    manager = ProxyManager.from_settings(settings)
+
+    chosen = {resolve_options(settings, proxies=manager).proxy.name for _ in range(6)}
+
+    assert chosen == {"OK"}
+
+
+def test_a_list_with_no_usable_proxy_is_reported(tmp_path: Path) -> None:
+    path = tmp_path / "all_bad.json"
+    path.write_text(
+        json.dumps({"proxys": {"BAD": "tg://proxy?server=1.2.3.4&port=443&secret=AAAA"}}),
+        encoding="utf-8",
+    )
+    settings = configured(tmp_path, proxy_enabled=True, proxy_file=path)
+    manager = ProxyManager.from_settings(settings)
+
+    with pytest.raises(ConfigError, match="No usable proxy"):
+        resolve_options(settings, proxies=manager)
+
+
+def test_an_all_bad_list_is_reported_not_a_crash(tmp_path: Path) -> None:
+    """Several unusable entries must end in the documented error, not a traceback."""
+    entries = {f"BAD{i}": f"tg://proxy?server=1.2.3.{i}&port=443&secret=AAAA{i}" for i in range(5)}
+    entries["TLS"] = f"tg://proxy?server=2.2.2.2&port=443&secret=ee{HEX_SECRET}"
+    path = tmp_path / "all_bad_many.json"
+    path.write_text(json.dumps({"proxys": entries}), encoding="utf-8")
+    settings = configured(tmp_path, proxy_enabled=True, proxy_file=path)
+    manager = ProxyManager.from_settings(settings)
+
+    with pytest.raises(ConfigError, match="No usable proxy"):
+        resolve_options(settings, proxies=manager)
+
+
+def test_the_bundled_proxy_list_still_yields_a_usable_connection(tmp_path: Path) -> None:
+    """Authentication must survive whatever the shipped proxy list contains.
+
+    The bundled list is scraped from public sources and mixes transports
+    Telethon cannot speak (fake-TLS) with entries whose secret does not decode
+    at all. Selection has to skip them and still return a proxy, because
+    ``xtg auth login`` fails outright when it cannot build a client.
+    """
+    settings = configured(tmp_path, proxy_enabled=True)
+    manager = ProxyManager.from_settings(settings)
+    assert manager.usable, "the bundled proxy list must not be empty"
+
+    options = resolve_options(settings, proxies=manager)
+
+    assert options.proxy is not None
+    assert to_telethon_proxy(options.proxy) is not None
+
+
+def test_selecting_from_a_realistic_mixed_list_never_hard_fails(tmp_path: Path) -> None:
+    """A list that is mostly unusable must still produce a connection."""
+    entries = {"BAD1": "tg://proxy?server=1.2.3.4&port=443&secret=AAAA"}
+    entries["TLS"] = f"tg://proxy?server=2.3.4.5&port=443&secret=ee{HEX_SECRET}"
+    for index in range(20):
+        entries[f"JUNK{index}"] = f"tg://proxy?server=9.9.9.{index}&port=443&secret=QUJD{index}"
+    entries["GOOD"] = f"tg://proxy?server=8.8.8.8&port=443&secret={HEX_SECRET}"
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"proxys": entries}), encoding="utf-8")
+
+    settings = configured(tmp_path, proxy_enabled=True, proxy_file=path)
+    manager = ProxyManager.from_settings(settings)
+
+    for _ in range(10):
+        options = resolve_options(settings, proxies=manager)
+        assert options.proxy is not None
+        assert to_telethon_proxy(options.proxy) is not None
+
+
+def _rejects(entry: Any) -> bool:
+    try:
+        to_telethon_proxy(entry)
+    except ConfigError:
+        return True
+    return False
 
 
 # --- client creation and lifecycle -----------------------------------------

@@ -63,9 +63,87 @@ def test_api_hash_is_masked_in_redacted(settings: Settings) -> None:
 
 
 def test_env_file_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
+    """``.env`` is read from the project home, not from the current directory."""
+    monkeypatch.setenv("XTG_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("XTG_SESSION_NAME=custom\n", encoding="utf-8")
     assert Settings().session_name == "custom"
+
+
+def test_env_file_ignores_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stray ``.env`` in the directory the CLI was started from is not read.
+
+    Regression: ``.env`` used to resolve against the process CWD, so running
+    ``xtg`` from anywhere but the project root silently dropped the real
+    configuration - and a test that asked for an isolated home got the
+    developer's real credentials instead.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / ".env").write_text("XTG_SESSION_NAME=leaked\n", encoding="utf-8")
+
+    monkeypatch.setenv("XTG_HOME", str(home))
+    monkeypatch.chdir(elsewhere)
+
+    assert Settings().session_name == "xtg"  # the default, not "leaked"
+
+
+def test_env_file_is_resolved_from_an_explicit_home(tmp_path: Path) -> None:
+    """``home=`` selects the ``.env`` that belongs to it."""
+    home = tmp_path / "custom"
+    home.mkdir()
+    (home / ".env").write_text("XTG_SESSION_NAME=explicit\n", encoding="utf-8")
+
+    config = Settings(home=home)
+
+    assert config.env_file == home / ".env"
+    assert config.session_name == "explicit"
+
+
+def test_a_non_numeric_api_id_is_a_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a typo in .env used to escape as a raw pydantic traceback."""
+    monkeypatch.setenv("XTG_API_ID", "not-a-number")
+    monkeypatch.setenv("XTG_API_HASH", "hash")
+
+    with pytest.raises(ConfigError) as exc:
+        Settings()
+
+    assert exc.value.exit_code == ExitCode.CONFIG
+    assert "api_id" in str(exc.value)
+
+
+def test_a_non_positive_api_id_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XTG_API_ID", "0")
+    with pytest.raises(ConfigError, match="api_id"):
+        Settings()
+
+
+def test_configuration_errors_never_echo_the_secret_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The offending value must not reach a log, a traceback or the terminal."""
+    monkeypatch.setenv("XTG_MAX_RETRIES", "super-secret-token")
+
+    with pytest.raises(ConfigError) as exc:
+        Settings()
+
+    assert "super-secret-token" not in str(exc.value)
+    assert "super-secret-token" not in (exc.value.hint or "")
+
+
+def test_invalid_configuration_points_at_the_right_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XTG_HOME", str(tmp_path))
+    monkeypatch.setenv("XTG_MAX_RETRIES", "0")
+
+    with pytest.raises(ConfigError) as exc:
+        Settings()
+
+    assert str(tmp_path / ".env") in (exc.value.hint or "")
 
 
 @pytest.mark.parametrize(

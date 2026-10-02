@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tests.fakes import FakeClient, FakeParticipant, FakeUser, make_chat, make_messages
+from tests.fakes import (
+    FakeClient,
+    FakeParticipant,
+    FakeUser,
+    make_chat,
+    make_messages,
+    write_session_file,
+)
 from typer.testing import CliRunner
 from xtg.cli.main import app
 from xtg.core.config import reload_settings
@@ -231,6 +238,86 @@ def test_auth_login_reports_missing_two_factor_password(
     assert result.exit_code == ExitCode.AUTH
 
 
+def test_auth_login_aborts_cleanly_at_the_phone_prompt(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C / closed stdin at the first prompt must still exit with a code.
+
+    Regression: only the 2FA prompt was guarded, so cancelling the phone or
+    code prompt surfaced a Click abort with exit status 1 instead of the
+    documented AUTH code.
+    """
+    client = FakeClient(authorized=False)
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(cli_app, ["auth", "login"], input="")
+
+    assert result.exit_code == ExitCode.AUTH
+    assert "No phone number provided" in result.output
+
+
+def test_auth_login_aborts_cleanly_at_the_code_prompt(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeClient(authorized=False)
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(cli_app, ["auth", "login"], input="+15550100\n")
+
+    assert result.exit_code == ExitCode.AUTH
+    assert "No login code provided" in result.output
+
+
+def test_auth_login_uses_the_configured_proxy(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Authentication must honour the proxy list like any other connection."""
+    proxy_list = tmp_path / "list.json"
+    proxy_list.write_text(
+        json.dumps({"proxys": {"PX": "socks5://127.0.0.1:1080"}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("XTG_PROXY_ENABLED", "true")
+    monkeypatch.setenv("XTG_PROXY_FILE", str(proxy_list))
+    reload_settings()
+
+    client = FakeClient(authorized=False, me=FakeUser(id=5, username="viaproxy"))
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(cli_app, ["auth", "login", "--phone", "+15550100", "--code", "1"])
+
+    assert result.exit_code == 0
+    assert "Authorized as @viaproxy" in result.output
+
+
+def test_auth_login_over_a_direct_connection(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    monkeypatch.setenv("XTG_PROXY_ENABLED", "false")
+    reload_settings()
+
+    client = FakeClient(authorized=False, me=FakeUser(id=6, username="viadirect"))
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(cli_app, ["auth", "login", "--phone", "+15550100", "--code", "1"])
+
+    assert result.exit_code == 0
+    assert "Authorized as @viadirect" in result.output
+
+
+def test_auth_login_short_circuits_an_authorized_session(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that is already authorized must not prompt for anything."""
+    client = FakeClient(authorized=True, me=FakeUser(id=8, username="alreadyin"))
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(cli_app, ["auth", "login"], input="")
+
+    assert result.exit_code == 0
+    assert "Already authorized as @alreadyin" in result.output
+    assert client.signed_in_with is None
+
+
 def test_auth_login_hardens_session_files(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
@@ -257,9 +344,7 @@ def test_auth_login_hardens_session_files(
 def test_auth_status_reports_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    session = isolated_home / "data" / "sessions" / "xtg"
-    session.parent.mkdir(parents=True, exist_ok=True)
-    session.write_bytes(b"session")
+    write_session_file(isolated_home / "data" / "sessions" / "xtg")
 
     result = runner.invoke(cli_app, ["auth", "status", "--json"])
 
@@ -267,16 +352,45 @@ def test_auth_status_reports_session(
     data = payload(result)
     assert data["configured"] is True
     assert data["session_exists"] is True
-    assert data["session_size_bytes"] == len(b"session")
+    assert data["session_size_bytes"] > 0
     assert data["state"] == "authorized"
+    assert data["authorized"] is True
+
+
+def test_auth_status_rejects_a_file_that_is_not_a_session(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    """Regression: a junk file used to be reported as an authorized account."""
+    session = isolated_home / "data" / "sessions" / "xtg"
+    session.parent.mkdir(parents=True, exist_ok=True)
+    session.write_bytes(b"not a session")
+
+    result = runner.invoke(cli_app, ["auth", "status", "--json"])
+
+    assert result.exit_code == 0
+    data = payload(result)
+    assert data["session_exists"] is True
+    assert data["state"] == "not_authorized"
+    assert data["authorized"] is False
+
+
+def test_auth_status_warns_about_a_broken_session(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    session = isolated_home / "data" / "sessions" / "xtg"
+    session.parent.mkdir(parents=True, exist_ok=True)
+    session.write_bytes(b"not a session")
+
+    result = runner.invoke(cli_app, ["auth", "status"])
+
+    assert result.exit_code == 0
+    assert "not a Telegram session file" in result.output
 
 
 def test_auth_status_table_with_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    session = isolated_home / "data" / "sessions" / "xtg"
-    session.parent.mkdir(parents=True, exist_ok=True)
-    session.write_bytes(b"session")
+    write_session_file(isolated_home / "data" / "sessions" / "xtg")
 
     result = runner.invoke(cli_app, ["auth", "status"])
 

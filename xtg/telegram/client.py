@@ -50,29 +50,17 @@ def to_telethon_proxy(entry: ProxyEntry | None) -> dict[str, Any] | None:
     Decoding follows the reference implementation (hex first, then base64, with
     ``ee``/``dd`` markers stripped) and lives in :mod:`xtg.proxy.mtproto` so the
     checker and the client can never disagree about what a secret means.
+
+    Raises:
+        ConfigError: when the entry cannot be used as a Telethon proxy.
     """
     if entry is None:
         return None
     if entry.type is ProxyType.MTPROTO:
-        if not entry.has_secret:
-            raise ConfigError(
-                f"MTProto proxy {entry.name} has no secret",
-                hint="Use tg://proxy?server=...&port=...&secret=...",
-            )
-        try:
-            info = mtproto.decode_secret(entry.secret or "")
-        except ProxyError as exc:
-            raise ConfigError(f"Proxy {entry.name} has an unusable secret: {exc}") from exc
-        if not info.checkable:
-            raise ConfigError(
-                f"Proxy {entry.name} uses a {info.kind} secret, which Telethon's "
-                f"plain MTProxy connection cannot use",
-                hint="Only 16-byte obfuscated2 secrets are supported.",
-            )
         return {
             "proxy_type": "mtproto",
             "addr": (entry.host, entry.port),
-            "password": info.key,
+            "password": decode_proxy_secret(entry).key,
         }
     types = {
         ProxyType.HTTP: "http",
@@ -94,6 +82,34 @@ def to_telethon_proxy(entry: ProxyEntry | None) -> dict[str, Any] | None:
         payload["username"] = entry.username or ""
         payload["password"] = entry.password or ""
     return payload
+
+
+def decode_proxy_secret(entry: ProxyEntry) -> mtproto.SecretInfo:
+    """Decode an MTProto entry's secret, or explain why it cannot be used.
+
+    Telethon speaks obfuscated2 and the ``dd`` randomized-intermediate
+    transport, so both are accepted here. Fake-TLS (``ee``) is a different
+    handshake that Telethon cannot perform, and is rejected with a clear reason
+    rather than a confusing connection failure.
+
+    Raises:
+        ConfigError: when the entry has no secret, or one Telethon cannot use.
+    """
+    if not entry.has_secret:
+        raise ConfigError(
+            f"MTProto proxy {entry.name} has no secret",
+            hint="Use tg://proxy?server=...&port=...&secret=...",
+        )
+    try:
+        info = mtproto.decode_secret(entry.secret or "")
+    except ProxyError as exc:
+        raise ConfigError(f"Proxy {entry.name} has an unusable secret: {exc}") from exc
+    if not info.telethon_usable:
+        raise ConfigError(
+            f"Proxy {entry.name} uses a {info.kind} secret, which Telethon cannot use",
+            hint="Only 16-byte obfuscated2 and dd randomized-intermediate secrets are supported.",
+        )
+    return info
 
 
 def select_proxy(settings: Settings | None = None) -> ProxyEntry | None:
@@ -126,8 +142,15 @@ class ClientOptions:
         return self.proxy.masked_url if self.proxy else "direct connection"
 
     def as_kwargs(self) -> dict[str, Any]:
-        """Keyword arguments for :class:`telethon.TelegramClient`."""
-        return {
+        """Keyword arguments for :class:`telethon.TelegramClient`.
+
+        MTProto proxies are special in Telethon: they need a dedicated
+        connection class and a ``(host, port, secret)`` tuple instead of the
+        generic mapping, because the secret has to be fed to the obfuscated2
+        handshake. The encoded secret is passed through untouched - Telethon
+        decodes it itself, in the same order we do.
+        """
+        kwargs: dict[str, Any] = {
             "session": str(self.session),
             "api_id": self.api_id,
             "api_hash": self.api_hash,
@@ -136,6 +159,34 @@ class ClientOptions:
             "request_retries": self.request_retries,
             "timeout": self.connect_timeout,
         }
+
+        if self.proxy is not None and self.proxy.type is ProxyType.MTPROTO:
+            info = decode_proxy_secret(self.proxy)
+            kwargs["connection"] = _mtproxy_connection(info.kind)
+            kwargs["proxy"] = (self.proxy.host, self.proxy.port, self.proxy.secret or "")
+        return kwargs
+
+
+def _mtproxy_connection(kind: str) -> Any:
+    """The Telethon connection class matching an MTProto secret kind.
+
+    ``dd`` secrets are only accepted by the randomized intermediate codec, so
+    the transport is chosen from the secret rather than hardcoded.
+
+    Raises:
+        ConfigError: when Telethon is not installed.
+    """
+    try:
+        from telethon.network import connection as telethon_connection
+    except ImportError as exc:  # pragma: no cover - guarded earlier by create_client
+        raise ConfigError(
+            "Telethon is not installed",
+            hint='Install the MTProto client with `uv add "telethon>=1.34"` followed by `uv sync`.',
+        ) from exc
+
+    if kind == "randomized-intermediate":
+        return telethon_connection.ConnectionTcpMTProxyRandomizedIntermediate
+    return telethon_connection.ConnectionTcpMTProxyIntermediate
 
 
 def resolve_options(
@@ -154,8 +205,15 @@ def resolve_options(
     entry: ProxyEntry | None = None
     if settings.proxy_enabled:
         manager = proxies or ProxyManager.from_settings(settings)
-        entry = manager.next_proxy()
-        logger.info("Proxy selection: {}", entry.name if entry else "none available")
+        entry, rejected = _select_usable(manager)
+        logger.info(
+            "Proxy selection: {}",
+            entry.name if entry else "none available",
+        )
+        for name in rejected:
+            # A malformed entry is a configuration problem worth surfacing once,
+            # but it must not stop us from using the rest of the list.
+            logger.warning("Skipping proxy {}: unusable MTProto secret", name)
     return ClientOptions(
         session=settings.session_file,
         api_id=settings.api_id or 0,
@@ -165,6 +223,45 @@ def resolve_options(
         request_retries=settings.max_retries,
         connect_timeout=settings.connect_timeout,
     )
+
+
+def _select_usable(manager: ProxyManager) -> tuple[ProxyEntry | None, list[str]]:
+    """Pick a proxy that can actually be used, skipping the ones that cannot.
+
+    A single malformed entry in the list (an MTProto secret that does not
+    decode, a fake-TLS secret Telethon cannot speak) used to abort the whole
+    connection, including ``xtg auth login``. Each rejected entry is remembered
+    as unhealthy so later selections prefer working proxies, and the returned
+    names let the caller report what was skipped.
+
+    Returns:
+        The chosen entry (or ``None`` when nothing is usable) and the names that
+        were rejected.
+    """
+    rejected: list[str] = []
+    for _ in range(len(manager)):
+        try:
+            entry = manager.next_proxy()
+        except ProxyError:
+            # Everything is excluded now; report it as a list problem below.
+            break
+        if entry is None:
+            break
+        try:
+            to_telethon_proxy(entry)
+        except ConfigError as exc:
+            logger.debug("Proxy {} is unusable: {}", entry.name, exc)
+            rejected.append(entry.name)
+            # Remember it so the pool drains away from the broken entries.
+            manager.mark_failure(entry)
+            continue
+        return entry, rejected
+    if rejected and not [e for e in manager.usable if e.name not in rejected]:
+        raise ConfigError(
+            f"No usable proxy in the list ({len(rejected)} rejected)",
+            hint="Fix or remove the rejected entries in the proxy list file.",
+        )
+    return None, rejected
 
 
 def create_client(options: ClientOptions) -> Any:

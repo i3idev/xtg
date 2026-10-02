@@ -6,8 +6,10 @@ only use the async surface of the client, so these doubles are enough.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from xtg.telegram.auth import _NamedSessionPasswordNeeded
@@ -237,3 +239,24 @@ def make_chat() -> FakeChat:
         channel=True,
         participants_count=3,
     )
+
+
+def write_session_file(path: Path, *, dc_id: int = 2, port: int = 443) -> Path:
+    """Create a file shaped like a real Telethon session database.
+
+    Telethon stores the auth key in a SQLite database with a ``sessions`` table.
+    ``xtg auth status`` checks for exactly that, so tests that need a session to
+    look authorized must build one instead of writing arbitrary bytes - writing
+    junk used to be enough to make the CLI claim the account was logged in.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE sessions (dc_id INTEGER PRIMARY KEY, server_address TEXT, port INTEGER,"
+            " auth_key BLOB)"
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+            (dc_id, "149.154.167.51", port, bytes(range(256))),
+        )
+    return path

@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from xtg.core.errors import ConfigError
@@ -61,8 +61,43 @@ class Settings(BaseSettings):
         validate_assignment=True,
     )
 
+    def __init__(self, **values: Any) -> None:
+        # ``env_file`` defaults to the bare name ``.env``, which pydantic-settings
+        # resolves against the *current working directory*. That is wrong here:
+        # the project home is the directory that actually holds the file (see
+        # :attr:`env_file`), and the CLI is routinely started from anywhere.
+        # Resolve it from ``home`` so XTG_HOME and an explicit ``home=`` both
+        # select the right .env, and so a test never picks up a developer's file.
+        values.setdefault("_env_file", self._resolve_env_file(values.get("home")))
+        try:
+            super().__init__(**values)
+        except ValidationError as exc:
+            # A typo in .env must read like a configuration problem, not like a
+            # crash. Only the field name and the reason are reported: echoing the
+            # value back could put a credential in a log or a terminal.
+            problems = ", ".join(
+                f"{'.'.join(str(part) for part in error['loc'])} ({error['type']})"
+                for error in exc.errors()
+            )
+            raise ConfigError(
+                f"Invalid configuration: {problems}",
+                hint=f"Check {self._resolve_env_file(values.get('home'))} for typos.",
+            ) from exc
+
+    @staticmethod
+    def _resolve_env_file(home: Any) -> Path:
+        """The ``.env`` that belongs to ``home`` (or to the detected project)."""
+        if isinstance(home, Path):
+            return home / ".env"
+        if isinstance(home, str) and home:
+            return Path(home).expanduser() / ".env"
+        override = _home_from_env()
+        return (override if override is not None else find_project_root()) / ".env"
+
     # --- Telegram ----------------------------------------------------------
-    api_id: int | None = Field(default=None, description="Telegram API id.")
+    # Telegram issues positive integers; anything else is a typo and is far
+    # clearer to reject here than as an opaque error from the API later.
+    api_id: int | None = Field(default=None, ge=1, description="Telegram API id.")
     api_hash: str | None = Field(default=None, repr=False, description="Telegram API hash.")
     session_name: str = Field(default="xtg", description="Telethon session name.")
 

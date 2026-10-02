@@ -148,7 +148,23 @@ class SecretInfo:
 
     @property
     def checkable(self) -> bool:
+        """True when the obfuscated2 handshake can probe this secret.
+
+        Only plain obfuscated2 can be health-checked: the probe speaks that
+        transport and waits for the proxy to hang up, which is meaningful only
+        for a server that actually terminates obfuscated2.
+        """
         return self.kind == "obfuscated2"
+
+    @property
+    def telethon_usable(self) -> bool:
+        """True when a Telethon client can connect with this secret.
+
+        Telethon implements the obfuscated2 and the ``dd`` randomized
+        intermediate transports, so both are usable. Fake-TLS is a different,
+        TLS-shaped handshake that Telethon cannot perform.
+        """
+        return self.kind in ("obfuscated2", "randomized-intermediate")
 
 
 def decode_secret(secret: str) -> SecretInfo:

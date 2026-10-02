@@ -14,6 +14,7 @@ Security notes:
 
 from __future__ import annotations
 
+import sqlite3
 import stat
 from dataclasses import dataclass
 from enum import StrEnum
@@ -36,19 +37,26 @@ class AuthState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
-    """Where the session lives and whether it looks usable."""
+    """Where the session lives and whether it looks usable.
+
+    ``exists`` only says a file is there. ``valid`` says it is a Telethon
+    session database, which is what :meth:`state` and the ``xtg auth status``
+    report rely on: a leftover or truncated file is present but useless, and
+    reporting it as "authorized" sends the user looking for the wrong problem.
+    """
 
     path: Path
     exists: bool
     locked: bool
     size_bytes: int
     mode: str = "-rw-r--r--"
+    valid: bool = False
 
     @property
     def state(self) -> AuthState:
         if self.locked:
             return AuthState.LOCKED
-        return AuthState.AUTHORIZED if self.exists else AuthState.NOT_AUTHORIZED
+        return AuthState.AUTHORIZED if self.valid else AuthState.NOT_AUTHORIZED
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +129,33 @@ def describe_session(settings: Settings | None = None) -> SessionInfo:
         locked=journal.exists(),
         size_bytes=path.stat().st_size if exists else 0,
         mode=_mode_string(path) if exists else "-",
+        valid=is_session_database(path) if exists else False,
     )
+
+
+def is_session_database(path: Path) -> bool:
+    """True when ``path`` really is a Telethon session file.
+
+    Telethon stores the session in a SQLite database with a ``sessions`` table
+    holding the auth key. Checking that locally is cheap and keeps
+    ``xtg auth status`` honest: any other file - a stale export, a truncated
+    write, a directory - is reported as "no session" instead of pretending the
+    account is logged in.
+
+    Never raises: a file that cannot be inspected is simply not a session.
+    """
+    if not path.is_file():
+        return False
+    try:
+        if path.stat().st_size == 0:
+            return False
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sessions'"
+            ).fetchone()
+    except (sqlite3.Error, OSError):
+        return False
+    return bool(row and row[0])
 
 
 def auth_state(settings: Settings | None = None) -> AuthState:

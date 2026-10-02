@@ -7,7 +7,7 @@ import stat
 from pathlib import Path
 
 import pytest
-from tests.fakes import FakeClient, FakeUser, StaticPrompter
+from tests.fakes import FakeClient, FakeUser, StaticPrompter, write_session_file
 from xtg.core.config import Settings
 from xtg.core.errors import AuthError
 from xtg.telegram import auth as telegram_auth
@@ -44,13 +44,39 @@ def test_describe_session_without_files(settings: Settings) -> None:
 
 
 def test_describe_session_with_file(settings: Settings) -> None:
-    path = telegram_auth.session_path(settings)
-    path.write_bytes(b"session-bytes")
+    path = write_session_file(telegram_auth.session_path(settings))
     info = telegram_auth.describe_session(settings)
     assert info.exists is True
-    assert info.size_bytes == len(b"session-bytes")
+    assert info.size_bytes == path.stat().st_size
     assert info.state is telegram_auth.AuthState.AUTHORIZED
     assert telegram_auth.session_files(settings) == [path]
+
+
+def test_a_file_that_is_not_a_session_is_not_reported_as_authorized(
+    settings: Settings,
+) -> None:
+    """A leftover or truncated file must not claim the account is logged in."""
+    path = telegram_auth.session_path(settings)
+    path.write_bytes(b"this is not a telethon session")
+
+    info = telegram_auth.describe_session(settings)
+
+    assert info.exists is True
+    assert info.valid is False
+    assert info.state is telegram_auth.AuthState.NOT_AUTHORIZED
+    assert telegram_auth.auth_state(settings) is telegram_auth.AuthState.NOT_AUTHORIZED
+
+
+def test_an_empty_session_file_is_not_a_session(settings: Settings) -> None:
+    path = telegram_auth.session_path(settings)
+    path.touch()
+    assert telegram_auth.describe_session(settings).valid is False
+
+
+def test_session_detection_never_raises_on_junk(settings: Settings) -> None:
+    path = telegram_auth.session_path(settings)
+    path.write_bytes(bytes(range(256)) * 8)  # not SQLite, must not blow up
+    assert telegram_auth.is_session_database(path) is False
 
 
 def test_session_files_includes_journal(settings: Settings) -> None:
