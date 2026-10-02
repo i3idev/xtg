@@ -5,8 +5,8 @@ and the async collector stay exactly as they are. This module is the adapter
 that presents them as a :class:`~xtg.sources.base.BaseSource`:
 
 * :meth:`TelegramSource.connect` / :meth:`TelegramSource.close` drive the async
-  connection through ``asyncio.run`` at the boundary, so the CLI stays
-  synchronous;
+  connection on a single event loop owned by the source, so the CLI stays
+  synchronous while the client never leaves the loop it connected on;
 * :meth:`TelegramCollectorAdapter.parse` / :meth:`~TelegramCollectorAdapter.save`
   map Telegram objects onto the same contract the Reddit source implements;
 * :meth:`TelegramCollectorAdapter.collect` translates the Telegram
@@ -20,7 +20,7 @@ section vocabulary is still declared through ``sections``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -70,7 +70,14 @@ class TelegramCollectorAdapter(BaseCollector):
         "members": "collect_members",
     }
 
-    def __init__(self, client: Any, database: Any, **options: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        database: Any,
+        *,
+        run: Callable[[Any], Any] | None = None,
+        **options: Any,
+    ) -> None:
         #: Run-wide metrics, exposed through ``SourceReport.details`` so the CLI
         #: can report throughput without the collector knowing about output.
         self.metrics = options.pop("metrics", None) or Metrics()
@@ -83,11 +90,15 @@ class TelegramCollectorAdapter(BaseCollector):
         }
         super().__init__(client, database, **base_options)
         self.delegate = TelegramCollector(client, database, metrics=self.metrics, **options)
+        # Telethon binds the client to the loop it connected on and refuses to
+        # work from another one, so the coroutines must be driven by whatever
+        # runs the connection - not by a fresh ``asyncio.run``.
+        self._run = run or asyncio.run
 
     # --- hooks -------------------------------------------------------------
     def resolve(self, session: Session, target: str) -> Any:  # noqa: ARG002 - async delegate
         """Resolve a target through the async delegate."""
-        return asyncio.run(self.delegate.resolve(target))
+        return self._run(self.delegate.resolve(target))
 
     def parse(self, raw: Any, kind: str | None = None) -> dict[str, Any]:
         """Telegram object -> column mapping (``chat``, ``user`` or ``message``)."""
@@ -133,7 +144,7 @@ class TelegramCollectorAdapter(BaseCollector):
         limit: int = 100,
     ) -> SourceReport:
         """Run the async Telegram collector and translate its report."""
-        report = asyncio.run(
+        report = self._run(
             self.delegate.run(target, sections=list(sections) or ["messages"], limit=limit)
         )
         return SourceReport(
@@ -166,26 +177,63 @@ class TelegramCollectorAdapter(BaseCollector):
 
 
 class TelegramSource(BaseSource):
-    """Telegram as a source: connect, parse, save, collect."""
+    """Telegram as a source: connect, parse, save, collect.
+
+    The whole Telegram life cycle runs on **one** event loop owned by this
+    instance. Telethon remembers the loop it connected on and refuses to work
+    from any other one ("the asyncio event loop must not change after
+    connection"), so driving ``open()``, target resolution, the walk and
+    ``close()`` from separate :func:`asyncio.run` calls - each of which builds
+    and tears down a fresh loop - breaks every collection.
+    """
 
     name = "telegram"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.connection: TelegramConnection | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """The single loop every Telegram coroutine of this source runs on."""
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            # Make it the default too, so anything that reaches for the current
+            # loop outside a coroutine sees the same one.
+            asyncio.set_event_loop(self._loop)
+        return self._loop
+
+    def _run(self, coro: Any) -> Any:
+        """Await ``coro`` on this source's loop."""
+        return self.loop.run_until_complete(coro)
+
+    def _release_loop(self) -> None:
+        """Drop the owned loop and leave a usable default behind."""
+        loop, self._loop = self._loop, None
+        if loop is not None and not loop.is_closed():
+            loop.close()
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
     def create_client(self) -> Any:
-        """Open the MTProto connection (the async boundary of this adapter)."""
+        """Open the MTProto connection on this source's loop."""
         self.connection = TelegramConnection(
             self.settings, require_authorized=self.require_authorized
         )
-        return asyncio.run(self.connection.open())
+        try:
+            return self._run(self.connection.open())
+        except BaseException:
+            # A failed ``__enter__`` never reaches ``close()``, so the loop this
+            # call just built would outlive the command.
+            self._release_loop()
+            raise
 
     def create_collector(self, client: Any) -> BaseCollector:
         settings = self.settings
         return TelegramCollectorAdapter(
             client,
             self.database,
+            run=self._run,
             delay=settings.request_delay,
             batch_size=settings.batch_size,
             queue_size=settings.queue_size,
@@ -210,10 +258,17 @@ class TelegramSource(BaseSource):
         return self.collector.collect(target, sections=sections, limit=limit)
 
     def close(self) -> None:
-        """Disconnect when a connection was opened; never raises."""
+        """Disconnect and release the loop. Never raises."""
         connection, self.connection = self.connection, None
-        if connection is not None:
-            asyncio.run(connection.close())
+        try:
+            # Must run before the loop reference is dropped: the client has to
+            # be disconnected on the very loop it connected on.
+            if connection is not None:
+                self._run(connection.close())
+        except Exception as exc:  # noqa: BLE001 - close must never raise
+            logger.debug("Telegram disconnect failed: {}", exc)
+        finally:
+            self._release_loop()
         super().close()
 
     @staticmethod

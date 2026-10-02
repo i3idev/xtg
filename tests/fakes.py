@@ -188,6 +188,55 @@ class _UsernameNotOccupied(Exception):
     """Mirrors ``telethon.errors.UsernameNotOccupiedError`` by name."""
 
 
+class LoopChangedError(RuntimeError):
+    """Mirrors the error Telethon raises when handed a different loop."""
+
+
+class LoopBoundClient(FakeClient):
+    """A :class:`FakeClient` that refuses to leave the loop it connected on.
+
+    Telethon raises ``the asyncio event loop must not change after connection``
+    when a live client is used from another loop, so the fake has to enforce the
+    same rule or a test would happily pass against a broken life cycle.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.loop: Any = None
+        #: Loop seen by every call that checks the constraint, in order.
+        self.seen_loops: list[Any] = []
+
+    def _check_loop(self) -> None:
+        import asyncio
+
+        running = asyncio.get_running_loop()
+        self.seen_loops.append(running)
+        if self.loop is not None and running is not self.loop:
+            raise LoopChangedError("the asyncio event loop must not change after connection")
+
+    async def connect(self) -> FakeClient:
+        import asyncio
+
+        self.loop = asyncio.get_running_loop()
+        return await super().connect()
+
+    async def disconnect(self) -> None:
+        self._check_loop()
+        await super().disconnect()
+
+    async def get_entity(self, value: Any) -> Any:
+        self._check_loop()
+        return await super().get_entity(value)
+
+    def iter_messages(self, entity: Any, **kwargs: Any) -> Any:
+        self._check_loop()
+        return super().iter_messages(entity, **kwargs)
+
+    def iter_participants(self, entity: Any, **kwargs: Any) -> Any:
+        self._check_loop()
+        return super().iter_participants(entity, **kwargs)
+
+
 async def _aiter(items: list[Any]) -> Any:
     for item in items:
         yield item

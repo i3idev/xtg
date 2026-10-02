@@ -19,6 +19,7 @@ from tests.fakes import (
     FakeClient,
     FakeParticipant,
     FakeUser,
+    LoopBoundClient,
     make_chat,
     make_messages,
     write_session_file,
@@ -150,6 +151,34 @@ def test_collect_unknown_target_exits_not_found(
     result = runner.invoke(cli_app, ["collect", "@ghost", "--messages"])
 
     assert result.exit_code == ExitCode.NOT_FOUND
+
+
+def test_collect_keeps_the_client_on_one_event_loop(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, chat: Any
+) -> None:
+    """``xtg collect`` must not hand the client to a second event loop.
+
+    Regression: connect, the walk and disconnect each ran their own
+    ``asyncio.run``, and the first API call after connecting died with
+    "the asyncio event loop must not change after connection".
+    """
+    client = LoopBoundClient(
+        entities={"example": chat},
+        messages=make_messages(4),
+        participants=[FakeParticipant(user=FakeUser(id=8, username="bob"))],
+    )
+    fake_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli_app, ["collect", "@example", "--messages", "--members", "-n", "2", "--json"]
+    )
+
+    assert result.exit_code == 0
+    data = payload(result)
+    assert data["messages"] == 2
+    assert client.seen_loops, "the client was never used"
+    assert len(set(map(id, client.seen_loops))) == 1
+    assert client.disconnected is True
 
 
 def test_collect_without_credentials(cli_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
