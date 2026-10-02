@@ -22,13 +22,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "rich>=13.7",
     "sqlalchemy>=2.0",
+    "telethon>=1.34",
     "typer>=0.12",
 ]
 
-# Phase 2 dependency (Telegram MTProto client). Requires network access to install:
-#   uv add "telethon>=1.34"
-# It is intentionally not declared yet so that Phase 1 stays installable offline;
-# xtg.telegram imports it lazily inside the functions that need a live connection.
+# Telethon is imported lazily (inside xtg.telegram.client.create_client) so the CLI
+# keeps working for every command that does not need a live MTProto connection.
 
 [project.scripts]
 xtg = "xtg.cli.main:run"
