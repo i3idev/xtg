@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,8 +12,9 @@ from xtg import __version__
 from xtg.cli import output
 from xtg.cli.context import get_app_context
 from xtg.core.config import mask_secret
-from xtg.core.errors import ExitCode
+from xtg.core.errors import AuthError, ExitCode
 from xtg.core.utils import format_size
+from xtg.telegram import auth as telegram_auth
 
 app = typer.Typer(
     name="auth",
@@ -21,17 +23,21 @@ app = typer.Typer(
 )
 
 
-def _session_files(session_path: Path) -> list[Path]:
-    """All files Telethon may have created for the configured session."""
-    if not session_path.exists():
-        return []
-    directory = session_path.parent
-    stem = session_path.name
-    return sorted(
-        path
-        for path in directory.iterdir()
-        if path.is_file() and (path.name == stem or path.name.startswith(f"{stem}."))
-    )
+class CliPrompter:
+    """Interactive prompts for the login flow.
+
+    Implements :class:`xtg.telegram.auth.Prompter` so the flow itself stays free
+    of any CLI dependency and can be driven by tests.
+    """
+
+    def phone(self) -> str:
+        return typer.prompt("Phone number (international format)")
+
+    def code(self) -> str:
+        return typer.prompt("Login code")
+
+    def password(self) -> str:
+        return typer.prompt("Two-factor password", hide_input=True)
 
 
 @app.command("status")
@@ -40,60 +46,105 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
     """Show whether the CLI is configured and authenticated."""
     app_ctx = get_app_context(ctx)
     settings = app_ctx.settings
-    files = _session_files(settings.session_file)
+    info = telegram_auth.describe_session(settings)
+    files = telegram_auth.session_files(settings)
     payload = {
         "version": __version__,
         "configured": settings.has_api_credentials,
         "api_id": settings.api_id,
         "api_hash": mask_secret(settings.api_hash),
         "session_name": settings.session_name,
-        "session_file": str(settings.session_file),
+        "session_file": str(info.path),
         "session_exists": bool(files),
         "session_files": [str(path) for path in files],
+        "session_size_bytes": info.size_bytes,
+        "session_mode": info.mode,
+        "session_locked": info.locked,
+        "state": telegram_auth.auth_state(settings),
         "authorized": bool(files) and settings.has_api_credentials,
     }
     if json_output:
         output.emit_json(payload)
         return
 
-    rows = [
-        ("version", __version__),
-        ("api id", payload["api_id"] or "not set"),
-        ("api hash", payload["api_hash"] or "not set"),
-        ("session name", settings.session_name),
-        ("session file", str(settings.session_file)),
-        ("authorized", "yes" if payload["authorized"] else "no"),
-    ]
-    output.kv_panel(dict(rows), title="Authentication")
+    output.kv_panel(
+        {
+            "version": __version__,
+            "state": payload["state"],
+            "api id": payload["api_id"] or "not set",
+            "api hash": payload["api_hash"] or "not set",
+            "session name": settings.session_name,
+            "session file": payload["session_file"],
+            "session size": format_size(info.size_bytes) if files else "-",
+            "permissions": info.mode,
+            "authorized": "yes" if payload["authorized"] else "no",
+        },
+        title="Authentication",
+    )
     if not payload["configured"]:
         output.hint(f"Set XTG_API_ID and XTG_API_HASH in {settings.env_file} (see .env.example).")
     elif not files:
         output.hint("No session found yet - run `xtg auth login`.")
+    elif info.locked:
+        output.warn("The session is in use by another xtg process.")
     if files:
         output.heading("Session files")
         output.print_table(
             output.table(
                 columns=("FILE", "SIZE", "MODIFIED"),
-                rows=[
-                    (
-                        path.name,
-                        format_size(path.stat().st_size),
-                        datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(
-                            timespec="seconds"
-                        ),
-                    )
-                    for path in files
-                ],
+                rows=[_file_row(path) for path in files],
             )
         )
 
 
 @app.command("login")
 @output.handle_errors
-def login(ctx: typer.Context) -> None:
-    """Interactive Telegram login (phone number, code, 2FA)."""
-    get_app_context(ctx).settings.require_api_credentials()
-    output.not_implemented("Telegram login (MTProto client)", phase="Phase 2")
+def login(
+    ctx: typer.Context,
+    phone: str | None = typer.Option(None, "--phone", help="Skip the phone prompt."),
+    code: str | None = typer.Option(None, "--code", help="Skip the code prompt."),
+    password: str | None = typer.Option(
+        None, "--password", help="2FA password (prefer the prompt; it is not stored)."
+    ),
+) -> None:
+    """Log into Telegram and store the session in the session directory.
+
+    Asks for the phone number, the login code and - only when 2FA is enabled -
+    the cloud password. The password is used once and never written to disk.
+    """
+    app_ctx = get_app_context(ctx)
+    settings = app_ctx.settings
+    settings.require_api_credentials()
+
+    prompter = _ScriptedPrompter(phone=phone, code=code, password=password)
+    output.info(f"Connecting Telegram (session: {settings.session_file.name})")
+    connection = app_ctx.connection(require_authorized=False)
+
+    async def _run() -> telegram_auth.LoginResult:
+        try:
+            client = await connection.open()
+            return await telegram_auth.login(client, prompter)
+        finally:
+            await connection.close()
+
+    result = asyncio.run(_run())
+    hardened = telegram_auth.harden_session_files(settings)
+
+    if result.already_authorized:
+        output.success(f"Already authorized as {result.display_name()}.")
+    else:
+        output.success(f"Authorized as {result.display_name()}.")
+    output.kv_panel(
+        {
+            "session": str(settings.session_file),
+            "user id": result.user_id or "-",
+            "username": f"@{result.username}" if result.username else "-",
+            "2FA used": "yes" if result.used_password else "no",
+            "files secured": ", ".join(path.name for path in hardened) or "-",
+        },
+        title="Session stored",
+    )
+    output.hint("The session grants full access to the account: keep data/sessions private.")
 
 
 @app.command("logout")
@@ -105,7 +156,7 @@ def logout(
     """Delete the local Telegram session and disconnect."""
     app_ctx = get_app_context(ctx)
     settings = app_ctx.settings
-    files = _session_files(settings.session_file)
+    files = telegram_auth.session_files(settings)
     if not files:
         output.info(f"No session to remove ({settings.session_file.name}).")
         raise typer.Exit
@@ -117,3 +168,35 @@ def logout(
         path.unlink(missing_ok=True)
         output.info(f"Removed {path.name}")
     output.success(f"Session {settings.session_name} removed.")
+
+
+class _ScriptedPrompter:
+    """Prompter that uses command line options when provided, else asks."""
+
+    def __init__(self, *, phone: str | None, code: str | None, password: str | None) -> None:
+        self._phone = phone
+        self._code = code
+        self._password = password
+        self.cli = CliPrompter()
+
+    def phone(self) -> str:
+        return self._phone if self._phone is not None else self.cli.phone()
+
+    def code(self) -> str:
+        return self._code if self._code is not None else self.cli.code()
+
+    def password(self) -> str:
+        if self._password is not None:
+            return self._password
+        try:
+            return self.cli.password()
+        except (typer.Abort, EOFError, KeyboardInterrupt) as exc:
+            raise AuthError(
+                "No 2FA password provided",
+                hint="Re-run `xtg auth login` and enter the cloud password.",
+            ) from exc
+
+
+def _file_row(path: Path) -> tuple[str, str, str]:
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(timespec="seconds")
+    return (path.name, format_size(path.stat().st_size), modified)

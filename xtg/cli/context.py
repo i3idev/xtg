@@ -14,6 +14,7 @@ import typer
 from xtg.core.config import Settings, get_settings
 from xtg.database.db import Database
 from xtg.proxy.manager import ProxyManager
+from xtg.telegram.client import TelegramConnection
 
 
 class AppContext:
@@ -47,6 +48,14 @@ class AppContext:
     def snapshot(self) -> dict[str, Any]:
         """Small dict used by ``xtg status --json``."""
         return {"settings": self.settings.redacted(), "paths": self._paths()}
+
+    def connection(self, *, require_authorized: bool = True) -> TelegramConnection:
+        """Build a Telegram connection from the current configuration.
+
+        The object is lazy: nothing connects until the client is requested, so
+        commands that fail validation never open a socket.
+        """
+        return TelegramConnection(self.settings, require_authorized=require_authorized)
 
     def _paths(self) -> dict[str, str]:
         settings = self.settings

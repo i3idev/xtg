@@ -1,11 +1,10 @@
-"""Telegram subsystem boundary.
+"""Telegram subsystem.
 
-Importing this package never imports Telethon: the MTProto client is created
-lazily inside :func:`xtg.telegram.client.get_client` so that `xtg --help`,
-`xtg status` and the whole database layer keep working without the dependency
-installed.
+Telethon is imported lazily (inside :func:`xtg.telegram.client.create_client`)
+so ``xtg --help``, ``xtg status`` and the whole database layer keep working
+without a live MTProto dependency.
 """
 
-from xtg.telegram.auth import AuthState, session_path
+from xtg.telegram.auth import AuthState, LoginResult, describe_session, login, session_path
 
-__all__ = ["AuthState", "session_path"]
+__all__ = ["AuthState", "LoginResult", "describe_session", "login", "session_path"]
