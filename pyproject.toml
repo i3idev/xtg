@@ -1,7 +1,7 @@
 [project]
 name = "xtg"
 version = "0.1.0"
-description = "eXtractorT - Telegram Intelligence & Extraction Toolkit"
+description = "eXtractorT - Social Media Intelligence & Extraction Toolkit"
 readme = "README.md"
 authors = [{ name = "I3idro", email = "my.os.linux1@gmail.com" }]
 keywords = ["telegram", "osint", "cli", "intelligence", "extraction"]
@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "loguru>=0.7",
+    "praw>=7.7",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
@@ -26,8 +27,9 @@ dependencies = [
     "typer>=0.12",
 ]
 
-# Telethon is imported lazily (inside xtg.telegram.client.create_client) so the CLI
-# keeps working for every command that does not need a live MTProto connection.
+# Telethon and PRAW are imported lazily (xtg.telegram.client.create_client and
+# xtg.sources.reddit.client.create_reddit) so the CLI keeps working for every
+# command that does not open a live connection to the platform.
 
 [project.scripts]
 xtg = "xtg.cli.main:run"
@@ -50,9 +52,9 @@ dev = [
     "ruff>=0.5",
 ]
 
-# Network note: this sandbox has no DNS, so `telethon` (runtime) and `pyright`
-# (dev) are declared but not installed here. Run `uv sync` once to materialise
-# uv.lock and the environment; every test works without Telethon installed.
+# Network note: this sandbox has no DNS, so `telethon` and `praw` (runtime) and
+# `pyright` (dev) are declared but not installed here. Run `uv sync` once to
+# materialise uv.lock and the environment; every test works without them.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -108,7 +110,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Typer's API requires function calls in argument defaults (typer.Option(...)).
 "xtg/cli/commands/*.py" = ["B008"]
-"tests/*" = ["ARG001"]
+# Test doubles implement the source contract, so they keep unused arguments.
+"tests/*" = ["ARG001", "ARG002"]
 
 [tool.ruff.format]
 quote-style = "double"
