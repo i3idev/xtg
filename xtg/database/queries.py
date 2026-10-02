@@ -172,6 +172,18 @@ def upsert_message(
     return message
 
 
+def latest_message_id(session: Session, chat: Chat) -> int | None:
+    """Newest stored message id of ``chat`` (used to resume a collection)."""
+    return session.scalar(
+        select(func.max(Message.telegram_message_id)).where(Message.chat_id == chat.id)
+    )
+
+
+def has_media(session: Session, message: Message) -> bool:
+    """True when media rows were already stored for ``message``."""
+    return bool(session.scalar(select(func.count(Media.id)).where(Media.message_id == message.id)))
+
+
 def build_message_search(
     keyword: str,
     *,

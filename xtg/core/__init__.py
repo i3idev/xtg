@@ -3,6 +3,7 @@
 from xtg.core.config import Settings, get_settings, reload_settings
 from xtg.core.errors import (
     AuthError,
+    CollectionError,
     ConfigError,
     DatabaseError,
     ExitCode,
@@ -16,6 +17,7 @@ from xtg.core.logger import configure_logging, logger
 
 __all__ = [
     "AuthError",
+    "CollectionError",
     "ConfigError",
     "DatabaseError",
     "ExitCode",

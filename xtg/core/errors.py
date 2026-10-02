@@ -22,6 +22,7 @@ class ExitCode(IntEnum):
     PROXY = 7
     NOT_FOUND = 8
     NOT_IMPLEMENTED = 9
+    COLLECTION = 10
     CANCELLED = 130
 
 
@@ -77,6 +78,12 @@ class NotFoundError(XTGError):
     """A requested entity does not exist in the local dataset."""
 
     exit_code = ExitCode.NOT_FOUND
+
+
+class CollectionError(XTGError):
+    """A collection run failed (Telegram refused the request, entity is gone)."""
+
+    exit_code = ExitCode.COLLECTION
 
 
 class FeatureNotAvailableError(XTGError):
