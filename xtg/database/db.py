@@ -14,6 +14,14 @@ from xtg.core.config import Settings, get_settings
 from xtg.core.errors import DatabaseError
 from xtg.database.models import Base
 
+#: Reddit tables, reported by ``xtg reddit status`` and ``xtg db stats``.
+REDDIT_TABLES: tuple[str, ...] = (
+    "reddit_users",
+    "reddit_subreddits",
+    "reddit_posts",
+    "reddit_comments",
+)
+
 #: Tables in a stable order, used by ``xtg db stats`` and ``xtg status``.
 TABLE_NAMES: tuple[str, ...] = (
     "users",
@@ -23,6 +31,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "media",
     "entities",
     "relations",
+    *REDDIT_TABLES,
 )
 
 

@@ -15,7 +15,19 @@ from sqlalchemy.orm import Session
 
 from xtg.core.errors import NotFoundError
 from xtg.core.utils import normalize_entity_ref, to_utc
-from xtg.database.models import Chat, Entity, Media, Membership, Message, Relation, User
+from xtg.database.models import (
+    Chat,
+    Entity,
+    Media,
+    Membership,
+    Message,
+    RedditComment,
+    RedditPost,
+    RedditSubreddit,
+    RedditUser,
+    Relation,
+    User,
+)
 
 # --- counting ---------------------------------------------------------------
 
@@ -295,3 +307,147 @@ def search_entities(session: Session, entity_type: str, pattern: str) -> Sequenc
         .where(Entity.type == entity_type, Entity.value.ilike(f"%{pattern}%"))
         .order_by(Entity.occurrences.desc())
     ).all()
+
+
+# --- Reddit -----------------------------------------------------------------
+# The Reddit tables live in the same database as the Telegram ones and use the
+# same rules: lookup by upstream id, then update, so a repeated collection
+# updates counters instead of inserting duplicates.
+
+
+def get_reddit_user(session: Session, reddit_id: str) -> RedditUser | None:
+    return session.scalar(select(RedditUser).where(RedditUser.reddit_id == reddit_id))
+
+
+def upsert_reddit_user(session: Session, reddit_id: str, **fields: Any) -> RedditUser:
+    """Create or update a Reddit account."""
+    user = get_reddit_user(session, reddit_id)
+    if user is None:
+        user = RedditUser(reddit_id=reddit_id, name=fields.pop("name", reddit_id), raw_data={})
+        session.add(user)
+    for key, value in fields.items():
+        if value is not None:
+            setattr(user, key, value)
+    session.flush()
+    return user
+
+
+def get_reddit_subreddit(session: Session, name: str) -> RedditSubreddit | None:
+    normalized = normalize_reddit_name(name)
+    return session.scalar(
+        select(RedditSubreddit).where(func.lower(RedditSubreddit.name) == normalized)
+    )
+
+
+def upsert_reddit_subreddit(session: Session, reddit_id: str, **fields: Any) -> RedditSubreddit:
+    """Create or update a subreddit."""
+    name = fields.pop("name", reddit_id)
+    subreddit = session.scalar(
+        select(RedditSubreddit).where(
+            func.lower(RedditSubreddit.name) == normalize_reddit_name(name)
+        )
+    )
+    if subreddit is None:
+        subreddit = RedditSubreddit(
+            reddit_id=reddit_id, name=normalize_reddit_name(name), raw_data={}
+        )
+        session.add(subreddit)
+    for key, value in fields.items():
+        if value is not None:
+            setattr(subreddit, key, value)
+    session.flush()
+    return subreddit
+
+
+def get_reddit_post(session: Session, reddit_id: str) -> RedditPost | None:
+    return session.scalar(select(RedditPost).where(RedditPost.reddit_id == reddit_id))
+
+
+def upsert_reddit_post(
+    session: Session,
+    reddit_id: str,
+    *,
+    subreddit: RedditSubreddit | None = None,
+    author: RedditUser | None = None,
+    **fields: Any,
+) -> RedditPost:
+    """Insert or update a submission, keeping collection runs idempotent."""
+    post = get_reddit_post(session, reddit_id)
+    if post is None:
+        post = RedditPost(reddit_id=reddit_id, title=fields.get("title") or reddit_id, raw_data={})
+        session.add(post)
+    if subreddit is not None:
+        post.subreddit_id = subreddit.id
+    if author is not None:
+        post.author_id = author.id
+    for key, value in fields.items():
+        if value is not None:
+            setattr(post, key, value)
+    if isinstance(post.created_utc, datetime):
+        post.created_utc = to_utc(post.created_utc)
+    session.flush()
+    return post
+
+
+def get_reddit_comment(session: Session, reddit_id: str) -> RedditComment | None:
+    return session.scalar(select(RedditComment).where(RedditComment.reddit_id == reddit_id))
+
+
+def upsert_reddit_comment(
+    session: Session,
+    reddit_id: str,
+    *,
+    post: RedditPost | None = None,
+    author: RedditUser | None = None,
+    **fields: Any,
+) -> RedditComment:
+    """Insert or update a comment."""
+    comment = get_reddit_comment(session, reddit_id)
+    if comment is None:
+        comment = RedditComment(reddit_id=reddit_id, raw_data={})
+        session.add(comment)
+    if post is not None:
+        comment.post_id = post.id
+    if author is not None:
+        comment.author_id = author.id
+    for key, value in fields.items():
+        if value is not None:
+            setattr(comment, key, value)
+    if isinstance(comment.created_utc, datetime):
+        comment.created_utc = to_utc(comment.created_utc)
+    session.flush()
+    return comment
+
+
+def list_reddit_posts(
+    session: Session,
+    subreddit: RedditSubreddit | None = None,
+    *,
+    limit: int | None = None,
+) -> Sequence[RedditPost]:
+    """Stored submissions, newest first (used to resume comment collection)."""
+    statement: Select[tuple[RedditPost]] = select(RedditPost)
+    if subreddit is not None:
+        statement = statement.where(RedditPost.subreddit_id == subreddit.id)
+    statement = statement.order_by(RedditPost.created_utc.desc())
+    if limit:
+        statement = statement.limit(limit)
+    return session.scalars(statement).all()
+
+
+def newest_reddit_post(session: Session, subreddit: RedditSubreddit) -> RedditPost | None:
+    """Newest stored submission of a subreddit, used to resume a collection."""
+    return session.scalar(
+        select(RedditPost)
+        .where(RedditPost.subreddit_id == subreddit.id)
+        .order_by(RedditPost.created_utc.desc(), RedditPost.id.desc())
+        .limit(1)
+    )
+
+
+def normalize_reddit_name(value: str) -> str:
+    """``r/Linux`` / ``/r/linux/`` / ``linux`` -> ``linux``."""
+    name = value.strip().strip("/")
+    if name.lower().startswith("r/"):
+        name = name[2:]
+    return name.strip("/").lower()

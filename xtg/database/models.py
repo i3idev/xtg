@@ -3,13 +3,14 @@
 Design notes
 ------------
 * Every entity table keeps ``raw_data`` (a JSON document with the original
-  Telegram payload) so nothing is lost and later phases can re-parse the data.
-* Integer primary keys are local surrogate keys; ``telegram_id`` keeps the
-  upstream identifier, which is unique per table.
+  payload) so nothing is lost and later phases can re-parse the data.
+* Integer primary keys are local surrogate keys; ``telegram_id`` /
+  ``reddit_id`` keep the upstream identifier, which is unique per table.
 * :class:`Relation` and :class:`Entity` store *string* node references instead
   of foreign keys. That keeps the knowledge graph able to link users, chats,
   messages and extracted pivots (emails, domains, phones, ...) in one table
-  without polymorphic foreign keys.
+  without polymorphic foreign keys - and it is what allows a second source
+  (Reddit) to join the same graph.
 * ``Message`` and ``Membership`` carry uniqueness constraints so that
   re-running a collection is idempotent (``INSERT ... ON CONFLICT`` via
   :func:`xtg.database.queries.upsert_message`).
@@ -181,7 +182,13 @@ class Media(Base):
 
 
 class Entity(Base, TimestampMixin):
-    """An extracted intelligence pivot (email, domain, phone, hashtag, ...)."""
+    """An extracted intelligence pivot (email, domain, phone, hashtag, ...).
+
+    ``source`` records which connector produced the pivot and ``first_seen_ref``
+    is the generic node reference (``reddit:post:t3_abc``) of the item that
+    revealed it. ``first_seen_id`` stays Telegram specific because it is a
+    foreign key into ``messages``; other sources use ``first_seen_ref``.
+    """
 
     __tablename__ = "entities"
     __table_args__ = (UniqueConstraint("type", "value", name="uq_entity_type_value"),)
@@ -189,9 +196,11 @@ class Entity(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     type: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     value: Mapped[str] = mapped_column(String(512), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), index=True, default="telegram", nullable=False)
     first_seen_id: Mapped[int | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
     )
+    first_seen_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
     occurrences: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSON, default=dict, nullable=False
@@ -223,3 +232,140 @@ class Relation(Base, TimestampMixin):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"<Relation {self.source} -[{self.relation_type}]-> {self.target}>"
+
+
+# --- Reddit -----------------------------------------------------------------
+# Reddit is a second source in the same database: no second SQLite file, no
+# duplicated knowledge graph. The `reddit_*` tables hold the relational view
+# (fast queries) while Entity and Relation stay source agnostic, so a Reddit
+# post and a Telegram message end up in one graph.
+
+
+class RedditUser(Base, TimestampMixin):
+    """A Reddit account (``t2_`` fullname)."""
+
+    __tablename__ = "reddit_users"
+    __table_args__ = (
+        UniqueConstraint("reddit_id", name="uq_reddit_user_id"),
+        UniqueConstraint("name", name="uq_reddit_user_name"),
+        Index("ix_reddit_users_karma", "comment_karma", "link_karma"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reddit_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    created_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    comment_karma: Mapped[int | None] = mapped_column(Integer)
+    link_karma: Mapped[int | None] = mapped_column(Integer)
+    verified: Mapped[bool] = mapped_column(default=False, nullable=False)
+    has_verified_email: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_employee: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_mod: Mapped[bool] = mapped_column(default=False, nullable=False)
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    @property
+    def ref(self) -> str:
+        """Knowledge-graph node reference."""
+        return f"reddit:user:{self.name}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<RedditUser u/{self.name}>"
+
+
+class RedditSubreddit(Base, TimestampMixin):
+    """A subreddit (``t5_`` fullname)."""
+
+    __tablename__ = "reddit_subreddits"
+    __table_args__ = (
+        UniqueConstraint("reddit_id", name="uq_reddit_subreddit_id"),
+        UniqueConstraint("name", name="uq_reddit_subreddit_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reddit_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(256))
+    public_description: Mapped[str | None] = mapped_column(Text)
+    subscribers: Mapped[int | None] = mapped_column(Integer)
+    over18: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    @property
+    def ref(self) -> str:
+        return f"reddit:subreddit:r/{self.name}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<RedditSubreddit r/{self.name}>"
+
+
+class RedditPost(Base, TimestampMixin):
+    """A submission (``t3_`` fullname)."""
+
+    __tablename__ = "reddit_posts"
+    __table_args__ = (
+        UniqueConstraint("reddit_id", name="uq_reddit_post_id"),
+        Index("ix_reddit_posts_subreddit", "subreddit_id", "created_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reddit_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    subreddit_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reddit_subreddits.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    author_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reddit_users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str | None] = mapped_column(String(1024))
+    permalink: Mapped[str | None] = mapped_column(String(512))
+    domain: Mapped[str | None] = mapped_column(String(255))
+    score: Mapped[int | None] = mapped_column(Integer)
+    num_comments: Mapped[int | None] = mapped_column(Integer)
+    upvote_ratio: Mapped[float | None] = mapped_column()
+    created_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    stickied: Mapped[bool] = mapped_column(default=False, nullable=False)
+    over_18: Mapped[bool] = mapped_column(default=False, nullable=False)
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    @property
+    def ref(self) -> str:
+        return f"reddit:post:{self.reddit_id}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<RedditPost {self.reddit_id} {self.title[:32]!r}>"
+
+
+class RedditComment(Base, TimestampMixin):
+    """A comment (``t1_`` fullname) on a submission."""
+
+    __tablename__ = "reddit_comments"
+    __table_args__ = (
+        UniqueConstraint("reddit_id", name="uq_reddit_comment_id"),
+        Index("ix_reddit_comments_post", "post_id", "created_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reddit_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    post_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reddit_posts.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    author_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reddit_users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    parent_reddit_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    body: Mapped[str | None] = mapped_column(Text)
+    score: Mapped[int | None] = mapped_column(Integer)
+    depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    is_submitter: Mapped[bool] = mapped_column(default=False, nullable=False)
+    stickied: Mapped[bool] = mapped_column(default=False, nullable=False)
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    @property
+    def ref(self) -> str:
+        return f"reddit:comment:{self.reddit_id}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<RedditComment {self.reddit_id} on post={self.post_id}>"
