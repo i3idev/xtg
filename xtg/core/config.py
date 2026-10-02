@@ -16,7 +16,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from xtg.core.errors import ConfigError
@@ -65,6 +65,45 @@ class Settings(BaseSettings):
     api_hash: str | None = Field(default=None, repr=False, description="Telegram API hash.")
     session_name: str = Field(default="xtg", description="Telethon session name.")
 
+    # --- Reddit ------------------------------------------------------------
+    # Both spellings are accepted: the bare REDDIT_* names used by PRAW's own
+    # documentation and the XTG_-prefixed ones that match every other setting.
+    # Secrets are never given a default value and never rendered in clear text.
+    reddit_client_id: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("REDDIT_CLIENT_ID", "XTG_REDDIT_CLIENT_ID"),
+        description="Reddit application client id.",
+    )
+    reddit_client_secret: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("REDDIT_CLIENT_SECRET", "XTG_REDDIT_CLIENT_SECRET"),
+        description="Reddit application client secret.",
+    )
+    reddit_user_agent: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("REDDIT_USER_AGENT", "XTG_REDDIT_USER_AGENT"),
+        description="Descriptive user agent Reddit requires for API clients.",
+    )
+    reddit_username: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("REDDIT_USERNAME", "XTG_REDDIT_USERNAME"),
+        description="Optional Reddit account used for authenticated requests.",
+    )
+    reddit_password: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("REDDIT_PASSWORD", "XTG_REDDIT_PASSWORD"),
+        description="Optional Reddit account password; only used with the username.",
+    )
+    reddit_listing: str = Field(
+        default="new",
+        validation_alias=AliasChoices("REDDIT_LISTING", "XTG_REDDIT_LISTING"),
+        description="Default subreddit listing: new, hot, top or controversial.",
+    )
+
     # --- Storage -----------------------------------------------------------
     home: Path = Field(default_factory=find_project_root, description="Project root.")
     database_path: Path = Field(
@@ -96,13 +135,28 @@ class Settings(BaseSettings):
     def _upper_log_level(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
 
-    @field_validator("api_id", "api_hash", "proxy_file", mode="before")
+    @field_validator(
+        "api_id",
+        "api_hash",
+        "proxy_file",
+        "reddit_client_id",
+        "reddit_client_secret",
+        "reddit_user_agent",
+        "reddit_username",
+        "reddit_password",
+        mode="before",
+    )
     @classmethod
     def _blank_means_unset(cls, value: object) -> object:
         """``XTG_API_ID=`` in .env means "not configured", not "invalid int"."""
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("reddit_listing", mode="before")
+    @classmethod
+    def _lower_reddit_listing(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
 
     # --- Derived paths -----------------------------------------------------
     @property
@@ -170,6 +224,20 @@ class Settings(BaseSettings):
     def has_api_credentials(self) -> bool:
         return self.api_id is not None and bool(self.api_hash)
 
+    @property
+    def has_reddit_credentials(self) -> bool:
+        """True when PRAW can build a read-only client."""
+        return bool(self.reddit_client_id and self.reddit_client_secret and self.reddit_user_agent)
+
+    @property
+    def has_reddit_account(self) -> bool:
+        """True when both optional account fields are present."""
+        return bool(self.reddit_username and self.reddit_password)
+
+    @property
+    def reddit_enabled(self) -> bool:
+        return self.has_reddit_credentials
+
     def require_api_credentials(self) -> None:
         """Fail loudly when Telegram credentials are missing."""
         missing = [
@@ -186,6 +254,44 @@ class Settings(BaseSettings):
                 ),
             )
 
+    def require_reddit_credentials(self) -> None:
+        """Fail loudly when Reddit credentials are missing."""
+        missing = [
+            name
+            for name, value in (
+                ("REDDIT_CLIENT_ID", self.reddit_client_id),
+                ("REDDIT_CLIENT_SECRET", self.reddit_client_secret),
+                ("REDDIT_USER_AGENT", self.reddit_user_agent),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigError(
+                f"Missing Reddit credentials: {', '.join(missing)}",
+                hint=(
+                    "Create a script app at https://www.reddit.com/prefs/apps and add the "
+                    f"values to {self.env_file} (see .env.example)."
+                ),
+            )
+        if bool(self.reddit_username) != bool(self.reddit_password):
+            raise ConfigError(
+                "REDDIT_USERNAME and REDDIT_PASSWORD must be set together",
+                hint="Both are optional; either fill in both or neither.",
+            )
+
+    def reddit_client_kwargs(self) -> dict[str, str]:
+        """Keyword arguments for :class:`praw.Reddit` (never logs them)."""
+        self.require_reddit_credentials()
+        kwargs = {
+            "client_id": str(self.reddit_client_id),
+            "client_secret": str(self.reddit_client_secret),
+            "user_agent": str(self.reddit_user_agent),
+        }
+        if self.has_reddit_account:
+            kwargs["username"] = str(self.reddit_username)
+            kwargs["password"] = str(self.reddit_password)
+        return kwargs
+
     def redacted(self) -> dict[str, object]:
         """Settings safe to print: secrets are replaced by a placeholder."""
         api_hash = self.api_hash
@@ -200,6 +306,12 @@ class Settings(BaseSettings):
             "session_name": self.session_name,
             "api_id": self.api_id if self.api_id else None,
             "api_hash": mask_secret(api_hash) if api_hash else None,
+            "reddit_configured": self.has_reddit_credentials,
+            "reddit_client_id": mask_secret(self.reddit_client_id)
+            if self.reddit_client_id
+            else None,
+            "reddit_user_agent": self.reddit_user_agent,
+            "reddit_account": str(self.reddit_username) if self.has_reddit_account else None,
         }
 
 
