@@ -367,3 +367,155 @@ def write_unrelated_sqlite(path: Path) -> Path:
         connection.execute("INSERT INTO notes (body) VALUES ('hello')")
         connection.commit()
     return path
+
+
+# --- realistic Telethon entity payloads -------------------------------------
+#
+# Telethon's ``to_dict()`` returns the constructor arguments of a TL object as
+# plain containers, but the *leaves* keep their Python types: a channel carries a
+# ``datetime``, a chat photo carries ``bytes``, and nested TL objects become
+# nested dicts. These fakes reproduce that shape verbatim, because the shallow
+# fakes above cannot express it and a raw entity is exactly what used to crash
+# the JSON column.
+
+#: A fixed instant, so every snapshot is byte-for-byte reproducible.
+FIXED_DATE = datetime(2013, 9, 24, 15, 27, 40, tzinfo=UTC)
+
+#: Bytes a real chat photo thumbnail carries, so encoding is exercised on
+#: data that is genuinely not text.
+THUMB_BYTES = bytes(range(32))
+
+
+def channel_to_dict() -> dict[str, Any]:
+    """The payload ``telethon.tl.types.Channel.to_dict()`` produces."""
+    return {
+        "_": "Channel",
+        "id": 1000000000,
+        "title": "Telegram",
+        "username": "telegram",
+        "date": FIXED_DATE,
+        "photo": {
+            "_": "ChatPhoto",
+            "stripped_thumb": THUMB_BYTES,
+            "photo_id": 54321,
+            "dc_id": 2,
+        },
+        "participants_count": 2_500_000,
+        "dc_id": 2,
+        "pinned_msg_id": 42,
+        "megagroup": False,
+        "verified": True,
+        "default_banned_rights": {
+            "_": "ChatBannedRights",
+            "until_date": None,
+            "view_messages": True,
+            "send_media": True,
+        },
+        "restrictions": [
+            {
+                "_": "ChatBannedRights",
+                "until_date": datetime(2030, 1, 1, tzinfo=UTC),
+                "send_messages": True,
+            }
+        ],
+        "usernames": [{"_": "Username", "username": "telegram", "editable": False, "active": True}],
+        "verify": {"_": "CodeVerification", "hash": b"\x01\x02\x03"},
+    }
+
+
+def message_to_dict() -> dict[str, Any]:
+    """The payload ``telethon.tl.types.Message.to_dict()`` produces."""
+    return {
+        "_": "Message",
+        "id": 42,
+        "date": FIXED_DATE,
+        "edit_date": datetime(2024, 5, 6, 7, 8, 9, tzinfo=UTC),
+        "message": "hello",
+        "from_id": {"_": "PeerUser", "user_id": 7},
+        "peer_id": {"_": "PeerChannel", "channel_id": 1000000000},
+        "reply_to": {
+            "_": "MessageReplyHeader",
+            "reply_to_msg_id": 41,
+            "reply_to_peer_id": {"_": "PeerChannel", "channel_id": 1000000000},
+            "reply_to_date": datetime(2024, 5, 6, 7, 0, 0, tzinfo=UTC),
+        },
+        "forwards": {
+            "_": "MessageFwdHeader",
+            "from_id": {"_": "PeerUser", "user_id": 8},
+            "date": datetime(2024, 4, 3, 2, 1, 0, tzinfo=UTC),
+            "channel_post": 41,
+        },
+        "media": {
+            "_": "MessageMediaDocument",
+            "document": {
+                "_": "Document",
+                "id": 777,
+                "date": FIXED_DATE,
+                "file_reference": b"\x00\xff\x10binary",
+                "thumb": {"_": "PhotoSize", "type": "x", "w": 90, "h": 90, "bytes": THUMB_BYTES},
+                "mime_type": "image/jpeg",
+            },
+        },
+        "entities": [{"_": "MessageEntityBold", "offset": 0, "length": 5}],
+        "views": 1234,
+        "post_author": None,
+    }
+
+
+class FakeChannelEntity:
+    """A channel whose ``to_dict()`` is the real Telethon shape."""
+
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        self._payload = channel_to_dict() if payload is None else payload
+        self.id = self._payload["id"]
+        self.title = self._payload["title"]
+        self.username = self._payload["username"]
+        self.participants_count = self._payload["participants_count"]
+        self.channel = True
+        self.verified = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._payload
+
+
+class FakeMessageEntity:
+    """A message whose ``to_dict()`` is the real Telethon shape."""
+
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        self._payload = message_to_dict() if payload is None else payload
+        self.id = self._payload["id"]
+        self.text = self._payload["message"]
+        self.date = self._payload["date"]
+        self.views = self._payload["views"]
+        self.reply_to = self._payload["reply_to"]
+        self.forwards = self._payload["forwards"]
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._payload
+
+
+class SlottedEntity:
+    """An entity with no ``__dict__`` and no ``to_dict``.
+
+    ``vars()`` raises ``TypeError`` on this, so the snapshot path that used it
+    crashed instead of describing the object.
+    """
+
+    __slots__ = ("id", "title", "date")
+
+    def __init__(self, identifier: int = 5, title: str = "Slotted", date: Any = None) -> None:
+        self.id = identifier
+        self.title = title
+        self.date = date if date is not None else FIXED_DATE
+
+
+class BrokenPayloadEntity:
+    """An entity whose ``to_dict()`` raises, as a malformed TL object can."""
+
+    def __init__(self, identifier: int = 6) -> None:
+        self.id = identifier
+        self.title = "Broken"
+        self.date = FIXED_DATE
+
+    def to_dict(self) -> dict[str, Any]:
+        raise RuntimeError("TL object is incomplete")

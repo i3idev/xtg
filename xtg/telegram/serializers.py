@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from xtg.core.utils import clean_username, to_utc
+from xtg.core.utils import RAW_TEXT_LIMIT, clean_username, to_jsonable_dict, to_utc
 
 #: Chat types as Telegram reports them, mapped to short stable names.
 CHAT_TYPES = {
@@ -37,30 +37,25 @@ MEDIA_TYPES = (
 )
 
 
-def serialize_raw(entity: Any, *, limit: int = 20_000) -> dict[str, Any]:
-    """Best-effort JSON-safe snapshot of a Telegram object.
+def serialize_raw(entity: Any, *, limit: int = RAW_TEXT_LIMIT) -> dict[str, Any]:
+    """JSON-safe snapshot of a Telegram object, for the ``raw_data`` column.
 
-    Used for the ``raw_data`` column: keeping the original payload means later
-    phases never have to re-fetch data.
+    Keeping the original payload means later phases never have to re-fetch data,
+    so nothing is dropped on purpose. What has to happen is a *representation*
+    change, not a data loss: a Telethon entity is not JSON (a channel has a
+    :class:`~datetime.datetime`, a chat photo has ``bytes``), and handing one to
+    a ``JSON`` column raises ``TypeError`` at flush time. Every value is
+    therefore passed through :func:`~xtg.core.utils.to_jsonable`, the single
+    normalisation boundary shared by the project.
+
+    ``None`` becomes ``{}``: a row with no snapshot is still worth storing, a
+    row that cannot be flushed is not. An object with no readable payload is
+    described by its public attributes, and one with neither is marked by type
+    rather than guessed at.
     """
     if entity is None:
         return {}
-    payload: Any = None
-    to_dict = getattr(entity, "to_dict", None)
-    if callable(to_dict):
-        try:
-            payload = to_dict()
-        except Exception:  # noqa: BLE001 - never let a payload break a collection
-            payload = None
-    if payload is None:
-        payload = {
-            key: value
-            for key, value in vars(entity).items()
-            if not key.startswith("_") and _is_scalar(value)
-        }
-    if not isinstance(payload, dict):
-        return {}
-    return _sanitize(payload, limit=limit)
+    return to_jsonable_dict(entity, limit=limit)
 
 
 def user_fields(entity: Any) -> dict[str, Any]:
@@ -194,24 +189,3 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _is_scalar(value: Any) -> bool:
-    return isinstance(value, str | int | float | bool | type(None))
-
-
-def _sanitize(payload: dict[str, Any], *, limit: int) -> dict[str, Any]:
-    """Drop bytes and huge strings so the JSON column stays usable."""
-    result: dict[str, Any] = {}
-    for key, value in payload.items():
-        if isinstance(value, bytes):
-            result[key] = f"<bytes:{len(value)}>"
-        elif isinstance(value, str) and len(value) > limit:
-            result[key] = f"{value[:limit]}…"
-        elif isinstance(value, dict | list | tuple):
-            result[key] = (
-                _sanitize(value, limit=limit) if isinstance(value, dict) else str(value)[:limit]
-            )
-        else:
-            result[key] = value
-    return result
