@@ -11,7 +11,18 @@ import typer.main
 
 from xtg import __version__
 from xtg.cli import output
-from xtg.cli.commands import analyze, auth, collect, db, export, info, proxy, search, status
+from xtg.cli.commands import (
+    analyze,
+    auth,
+    collect,
+    db,
+    export,
+    info,
+    proxy,
+    reddit,
+    search,
+    status,
+)
 from xtg.cli.context import AppContext
 from xtg.core.config import get_settings
 from xtg.core.errors import ExitCode, XTGError
@@ -30,8 +41,8 @@ class XTGApp(typer.Typer):
 app = XTGApp(
     name="xtg",
     help=(
-        "eXtractorT - Telegram Intelligence & Extraction Toolkit.\n\n"
-        "A CLI toolkit to collect, search, analyze and export Telegram data."
+        "eXtractorT - Social Media Intelligence & Extraction Toolkit.\n\n"
+        "A CLI toolkit to collect, search, analyze and export Telegram and Reddit data."
     ),
     no_args_is_help=True,
     add_completion=True,
@@ -39,6 +50,7 @@ app = XTGApp(
 
 app.add_typer(auth.app, name="auth")
 app.add_typer(proxy.app, name="proxy")
+app.add_typer(reddit.app, name="reddit")
 app.add_typer(info.app, name="info")
 app.add_typer(analyze.app, name="analyze")
 app.add_typer(db.app, name="db")

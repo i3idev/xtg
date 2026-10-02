@@ -14,6 +14,8 @@ import typer
 from xtg.core.config import Settings, get_settings
 from xtg.database.db import Database
 from xtg.proxy.manager import ProxyManager
+from xtg.sources.base import BaseSource
+from xtg.sources.registry import get_source
 from xtg.telegram.client import TelegramConnection
 
 
@@ -56,6 +58,14 @@ class AppContext:
         commands that fail validation never open a socket.
         """
         return TelegramConnection(self.settings, require_authorized=require_authorized)
+
+    def source(self, name: str, **kwargs: Any) -> BaseSource:
+        """Build a collection source by name (``telegram``, ``reddit``, ...).
+
+        Sources are imported lazily, so a command only pays for the platform it
+        actually uses.
+        """
+        return get_source(name, self.settings, database=self.db, **kwargs)
 
     def _paths(self) -> dict[str, str]:
         settings = self.settings
