@@ -8,9 +8,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from xtg.core.config import Settings
+from xtg.core.config import Settings, reload_settings
 from xtg.database.db import Database
 from xtg.proxy.manager import ProxyManager
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings_cache() -> Iterator[None]:
+    """Drop the process-wide settings cache around every test.
+
+    ``get_settings()`` is cached, so without this each test would reuse the home
+    directory of whichever test ran first.
+    """
+    reload_settings()
+    yield
+    reload_settings()
 
 
 @pytest.fixture
@@ -19,7 +31,10 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.chdir(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    config = Settings(home=home, log_to_file=False, proxy_enabled=False)
+    monkeypatch.setenv("XTG_HOME", str(home))
+    monkeypatch.setenv("XTG_LOG_TO_FILE", "false")
+    monkeypatch.setenv("XTG_PROXY_ENABLED", "false")
+    config = reload_settings()
     config.ensure_directories()
     return config
 
