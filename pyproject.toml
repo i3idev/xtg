@@ -44,16 +44,39 @@ source-include = ["xtg/proxy/list_proxy.json"]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.380",
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+
+# Network note: this sandbox has no DNS, so `telethon` (runtime) and `pyright`
+# (dev) are declared but not installed here. Run `uv sync` once to materialise
+# uv.lock and the environment; every test works without Telethon installed.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 asyncio_mode = "strict"
 filterwarnings = ["error::DeprecationWarning:xtg.*"]
+
+# Type checking foundation. Pyright is used because the codebase relies on
+# PEP 695 syntax (`def f[**P, R]`, `type X = ...`) and on duck-typed
+# Telethon objects, where "basic" keeps the signal high without demanding
+# annotations that would only restate the protocol boundary.
+[tool.pyright]
+include = ["xtg", "tests"]
+exclude = ["data", ".venv"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+# Telethon is imported lazily and ships no stubs: the boundary uses `Any`.
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportUnknownArgumentType = false
 
 [tool.ruff]
 line-length = 100
