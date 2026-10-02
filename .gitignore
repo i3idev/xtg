@@ -1,0 +1,31 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime data (sessions, database, logs are never committed)
+data/database.db
+data/database.db-*
+data/database.db.bak
+data/logs/
+data/sessions/*
+!data/sessions/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+
+# OS
+.DS_Store
