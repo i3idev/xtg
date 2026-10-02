@@ -31,6 +31,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "media",
     "entities",
     "relations",
+    "collection_cursors",
     *REDDIT_TABLES,
 )
 
@@ -160,7 +161,17 @@ class Database:
 
 
 def _apply_sqlite_pragmas(engine: Engine) -> None:
-    """WAL + foreign keys: durability and cascade support on SQLite."""
+    """Tune SQLite for the collection workload.
+
+    * ``foreign_keys`` - cascade deletes (``media`` of a deleted message).
+    * ``journal_mode=WAL`` + ``synchronous=NORMAL`` - readers never block the
+      writer, and a process crash still recovers; only an OS-level power loss can
+      lose the last transactions. This is the standard trade-off for an append
+      heavy dataset and is what makes batching pay off.
+    * ``cache_size`` / ``temp_store`` / ``mmap_size`` - keep the working set in
+      memory so a 500 row batch is written without touching the disk per row.
+    * ``busy_timeout`` - wait instead of failing when the writer is contended.
+    """
 
     @event.listens_for(engine, "connect")
     def _set_pragmas(dbapi_connection: Any, _record: Any) -> None:  # pragma: no cover - driver hook
@@ -169,6 +180,10 @@ def _apply_sqlite_pragmas(engine: Engine) -> None:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA cache_size=-65536")  # 64 MiB page cache
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA mmap_size=268435456")  # 256 MiB
+        cursor.execute("PRAGMA wal_autocheckpoint=4000")
         cursor.close()
 
 

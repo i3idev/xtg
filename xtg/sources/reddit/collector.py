@@ -18,7 +18,7 @@ Rules shared with the Telegram collector:
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,11 +28,19 @@ from xtg.core.errors import AuthError, CollectionError, NotFoundError, XTGError
 from xtg.core.logger import logger
 from xtg.database import queries
 from xtg.database.models import RedditComment, RedditPost, RedditSubreddit
+from xtg.database.reddit_writer import RedditBatchWriter
+from xtg.database.writer import WriteResult
 from xtg.sources.base import BaseCollector, SavedItem, SourceReport
 from xtg.sources.reddit import serializers
 
 #: Subreddit listings Reddit accepts, mapped to the PRAW method name.
 LISTINGS: tuple[str, ...] = ("new", "hot", "top", "controversial", "rising")
+
+
+def _without(fields: Mapping[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    """Copy of ``fields`` without ``keys``; the batch writer owns those columns."""
+    return {key: value for key, value in fields.items() if key not in keys}
+
 
 #: Item kind -> the plural counter name used in reports and CLI tables, so the
 #: Reddit report reads like the Telegram one (``posts``, ``comments``, ...).
@@ -145,7 +153,14 @@ class RedditCollector(BaseCollector):
             self._account(self.save(session, parsed), report)
 
     def collect_posts(self, context: SubredditTarget, *, limit: int, report: SourceReport) -> None:
-        """Store submissions newest first, resuming after the newest known post."""
+        """Store submissions newest first, resuming after the newest known post.
+
+        Rows are buffered and written by
+        :class:`~xtg.database.reddit_writer.RedditBatchWriter`, which collapses
+        the per-item lookups into a few statements per batch. The ``after`` token
+        of the last stored submission rides along in the same transaction, so an
+        interrupted listing resumes where it stopped.
+        """
         with self.database.session() as session:
             subreddit = self._subreddit_row(session, context)
             newest = queries.newest_reddit_post(session, subreddit) if subreddit else None
@@ -153,14 +168,96 @@ class RedditCollector(BaseCollector):
         if cursor:
             logger.debug("Resuming r/{} after {}", context.name, cursor)
 
-        batch: list[dict[str, Any]] = []
+        writer = RedditBatchWriter(
+            self.database, batch_size=self.batch_size, target=context.name, section="posts"
+        )
+        newest_seen = cursor
         for submission in self._listing(context, limit=limit, after=cursor):
-            batch.append(self.parse(submission))
-            if len(batch) >= self.batch_size:
-                self._flush_posts(context, batch, report)
-                batch = []
-        if batch:
-            self._flush_posts(context, batch, report)
+            try:
+                parsed = self.parse(submission)
+                parsed["subreddit"] = context.name
+            except Exception as exc:  # noqa: BLE001 - one bad item must not stop the section
+                report.errors.append(f"post: {exc}")
+                logger.debug("Could not parse a Reddit post: {}", exc)
+                continue
+            newest_seen = str(parsed.get("reddit_id") or newest_seen)
+            writer.add_post(
+                _without(parsed, ("kind", "subreddit")),
+                author=parsed.get("author"),
+                relations=self._post_edges(parsed),
+                entities=self._post_entities(parsed),
+            )
+            if writer.full:
+                result = writer.flush()
+                self._account_batch(result, report)
+        writer.set_cursor(newest_seen)
+        result = writer.close()
+        self._account_batch(result, report)
+
+    def _post_edges(self, parsed: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Graph edges of one submission: subreddit -> post, author -> post."""
+        ref = f"reddit:post:{parsed.get('reddit_id')}"
+        edges = [
+            {
+                "source": f"reddit:subreddit:r/{self._target_name(parsed)}",
+                "target": ref,
+                "relation_type": "contains",
+            }
+        ]
+        author = parsed.get("author")
+        if author and author.get("name"):
+            edges.append(
+                {
+                    "source": f"reddit:user:{author['name']}",
+                    "target": ref,
+                    "relation_type": "authored",
+                }
+            )
+        return edges
+
+    def _post_entities(self, parsed: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Pivots of one submission: the link domain and any hashtags."""
+        ref = f"reddit:post:{parsed.get('reddit_id')}"
+        entities: list[dict[str, Any]] = []
+        domain = serializers.domain_of(parsed.get("url"))
+        if domain:
+            entities.append(
+                {
+                    "type": "domain",
+                    "value": domain,
+                    "source": self.source,
+                    "first_seen_ref": ref,
+                }
+            )
+        for tag in serializers.hashtags(parsed.get("title")):
+            entities.append(
+                {
+                    "type": "hashtag",
+                    "value": tag,
+                    "source": self.source,
+                    "first_seen_ref": ref,
+                }
+            )
+        return entities
+
+    @staticmethod
+    def _target_name(parsed: Mapping[str, Any]) -> str:
+        return str(parsed.get("subreddit") or parsed.get("target") or "unknown")
+
+    @staticmethod
+    def _account_batch(result: WriteResult, report: SourceReport) -> None:
+        """Fold one flushed batch into the report.
+
+        ``counts`` totals everything the batch touched (new plus already known),
+        matching what :meth:`SourceReport.add` recorded per item before;
+        ``duplicated`` carries the already-known rows.
+        """
+        report.counts["posts"] = report.counts.get("posts", 0) + result.inserted + result.updated
+        report.duplicated += result.updated
+        if result.relations:
+            report.counts["relations"] = report.counts.get("relations", 0) + result.relations
+        if result.entities:
+            report.counts["entities"] = report.counts.get("entities", 0) + result.entities
 
     def collect_comments(
         self, context: SubredditTarget, *, limit: int, report: SourceReport

@@ -26,6 +26,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from xtg.core.logger import logger
+from xtg.core.metrics import Metrics
+from xtg.core.retry import RetryPolicy
 from xtg.database import queries
 from xtg.sources.base import BaseCollector, BaseSource, SavedItem, SourceReport
 from xtg.telegram import serializers
@@ -69,8 +71,18 @@ class TelegramCollectorAdapter(BaseCollector):
     }
 
     def __init__(self, client: Any, database: Any, **options: Any) -> None:
-        super().__init__(client, database, **options)
-        self.delegate = TelegramCollector(client, database, **options)
+        #: Run-wide metrics, exposed through ``SourceReport.details`` so the CLI
+        #: can report throughput without the collector knowing about output.
+        self.metrics = options.pop("metrics", None) or Metrics()
+        # Options the base engine understands; the rest configure the async
+        # delegate (queue size, resume, retry policy).
+        base_options = {
+            name: options.pop(name)
+            for name in ("delay", "batch_size", "progress")
+            if name in options
+        }
+        super().__init__(client, database, **base_options)
+        self.delegate = TelegramCollector(client, database, metrics=self.metrics, **options)
 
     # --- hooks -------------------------------------------------------------
     def resolve(self, session: Session, target: str) -> Any:  # noqa: ARG002 - async delegate
@@ -134,6 +146,13 @@ class TelegramCollectorAdapter(BaseCollector):
             },
             duplicated=report.duplicated,
             errors=list(report.errors),
+            details={
+                "batches": report.batches,
+                "cursor": report.cursor,
+                "backpressure_waits": self.metrics.get("backpressure_waits"),
+                "retries": self.metrics.get("retries"),
+                "items_per_second": round(self.metrics.rate("messages_written"), 1),
+            },
         )
 
     @staticmethod
@@ -163,10 +182,19 @@ class TelegramSource(BaseSource):
         return asyncio.run(self.connection.open())
 
     def create_collector(self, client: Any) -> BaseCollector:
+        settings = self.settings
         return TelegramCollectorAdapter(
             client,
             self.database,
-            delay=self.settings.request_delay,
+            delay=settings.request_delay,
+            batch_size=settings.batch_size,
+            queue_size=settings.queue_size,
+            resume=settings.resume,
+            retry_policy=RetryPolicy(
+                attempts=settings.max_retries,
+                base_delay=settings.retry_base_delay,
+                max_delay=settings.retry_max_delay,
+            ),
             progress=self._progress,
         )
 

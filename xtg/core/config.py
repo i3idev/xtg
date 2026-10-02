@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -129,6 +130,46 @@ class Settings(BaseSettings):
     request_delay: float = Field(default=0.5, ge=0.0, description="Delay between API calls.")
     max_retries: int = Field(default=3, ge=1, description="Retries for transient failures.")
     connect_timeout: float = Field(default=10.0, gt=0.0, description="Socket timeout.")
+
+    # --- Performance -------------------------------------------------------
+    #: Rows per database transaction. Larger batches mean fewer commits; the
+    #: defaults trade a little memory for a lot less write overhead.
+    batch_size: int = Field(
+        default=500, ge=1, le=100_000, description="Rows written per transaction."
+    )
+    reddit_batch_size: int = Field(
+        default=200, ge=1, le=100_000, description="Reddit rows written per transaction."
+    )
+    #: Rows buffered between the API reader and the database writer. This is the
+    #: bound on in-flight work, so it also bounds memory.
+    queue_size: int = Field(
+        default=1000, ge=1, description="Rows buffered between reader and writer."
+    )
+    #: How many items may be in flight at once. The pool adapts inside
+    #: ``min_concurrency``..``max_concurrency`` based on success rate.
+    concurrency: int = Field(
+        default=4, ge=1, description="Concurrent workers for the bounded pool."
+    )
+    min_concurrency: int = Field(
+        default=1, ge=1, description="Lower bound the adaptive pool shrinks to."
+    )
+    max_concurrency: int = Field(
+        default=8, ge=1, description="Upper bound the adaptive pool grows to."
+    )
+    #: Continue after the stored cursor instead of re-walking a whole history.
+    resume: bool = Field(default=False, description="Resume from the stored collection cursor.")
+    retry_base_delay: float = Field(
+        default=0.5, gt=0.0, description="First backoff delay, doubled per attempt."
+    )
+    retry_max_delay: float = Field(
+        default=30.0, gt=0.0, description="Cap for a computed backoff delay."
+    )
+
+    @field_validator("max_concurrency", mode="after")
+    @classmethod
+    def _at_least_min_concurrency(cls, value: int, info: Any) -> int:
+        minimum = info.data.get("min_concurrency", 1)
+        return max(value, minimum)
 
     @field_validator("log_level", mode="before")
     @classmethod

@@ -241,6 +241,31 @@ class Relation(Base, TimestampMixin):
 # post and a Telegram message end up in one graph.
 
 
+class CollectionCursor(Base, TimestampMixin):
+    """Resume cursor of a ``(source, target, section)`` collection.
+
+    The cursor is the upstream identifier the collector reached last (a
+    Telegram message id, a Reddit ``after`` token). It is written inside the
+    same transaction as the rows it covers, so an interrupted run resumes from
+    the last *committed* position instead of from the beginning, and a rollback
+    can never leave a cursor pointing at data that was not stored.
+    """
+
+    __tablename__ = "collection_cursors"
+    __table_args__ = (
+        UniqueConstraint("source", "target", "section", name="uq_cursor_source_target_section"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    target: Mapped[str] = mapped_column(String(256), nullable=False)
+    section: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    cursor: Mapped[str] = mapped_column(String(256), nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<CollectionCursor {self.source}:{self.target}/{self.section or '-'}>"
+
+
 class RedditUser(Base, TimestampMixin):
     """A Reddit account (``t2_`` fullname)."""
 

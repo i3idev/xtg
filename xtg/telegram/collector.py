@@ -13,8 +13,15 @@ Rules enforced here:
   backwards, so new messages are never missed and an interrupted run can simply
   be repeated
 * media is stored as metadata only (no downloads in Phase 2)
-* messages are written in batches, so an interrupted run keeps what it already
-  collected
+* rows are written in batches through :class:`~xtg.database.writer.BatchWriter`,
+  which stores the resume cursor in the same transaction as the rows it covers.
+  An interrupted run therefore resumes from the last *committed* position instead
+  of re-walking the whole history.
+
+The streaming side is a producer/consumer pair: one task reads the API while a
+bounded queue buffers parsed rows. The queue is what stops a fast producer from
+buffering an entire channel in memory, and it lets the two sides overlap so a
+database commit does not stall the network read.
 """
 
 from __future__ import annotations
@@ -26,16 +33,56 @@ from typing import Any, Protocol
 
 from xtg.core.errors import CollectionError, NotFoundError
 from xtg.core.logger import logger
+from xtg.core.metrics import Metrics
+from xtg.core.retry import RetryPolicy, classify, retry_after_of
 from xtg.core.utils import normalize_entity_ref
 from xtg.database import queries
 from xtg.database.db import Database
 from xtg.database.models import Chat, Message, User
+from xtg.database.writer import BatchWriter, WriteResult, load_cursor
+from xtg.pipeline import BoundedQueue
 from xtg.telegram import serializers
 
 #: Messages written per transaction while streaming the history.
 BATCH_SIZE = 500
 
+#: Parsed rows buffered between the reader and the writer.
+QUEUE_SIZE = 1000
+
+#: Depth at which the producer counts as being throttled by the writer.
+QUEUE_HIGH_WATER = 0.8
+
 ProgressHook = Callable[[str, int, int], Awaitable[None] | None]
+
+#: Marks the end of the producer's stream.
+_SENTINEL = object()
+
+
+def _message_id(message: Any) -> int | None:
+    """The upstream id of a raw message, without full serialization."""
+    value = getattr(message, "id", None)
+    return int(value) if value is not None else None
+
+
+def _parsed_row(
+    message: Any,
+) -> tuple[int, dict[str, Any], dict[str, Any] | None, list[dict[str, Any]]]:
+    """Serialize one API message into what the writer needs.
+
+    Serialization happens on the producer side, which keeps the consumer's
+    critical path down to a buffer append. It also means the raw Telegram object
+    never crosses the queue, so a large ``raw_data`` payload is released as soon
+    as the row is built.
+    """
+    fields = serializers.message_fields(message)
+    telegram_id = int(fields.get("telegram_message_id") or 0)
+    entity = getattr(message, "sender", None)
+    sender = (
+        serializers.user_fields(entity)
+        if entity is not None and getattr(entity, "id", None) is not None
+        else None
+    )
+    return telegram_id, fields, sender, serializers.media_entries(message)
 
 
 @dataclass(slots=True)
@@ -47,6 +94,12 @@ class CollectionReport:
     duplicated: int = 0
     members: int = 0
     media: int = 0
+    #: How far the run got, stored as the resume cursor.
+    cursor: str | None = None
+    #: Batches committed during the run.
+    batches: int = 0
+    #: Set when rows were dropped because the producer outran the consumer.
+    backpressure_drops: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -59,6 +112,9 @@ class CollectionReport:
         self.duplicated += other.duplicated
         self.members += other.members
         self.media += other.media
+        self.batches += other.batches
+        self.backpressure_drops += other.backpressure_drops
+        self.cursor = other.cursor or self.cursor
         self.errors.extend(other.errors)
         return self
 
@@ -83,13 +139,24 @@ class TelegramCollector:
         *,
         delay: float = 0.0,
         batch_size: int = BATCH_SIZE,
+        queue_size: int = QUEUE_SIZE,
         progress: ProgressHook | None = None,
+        metrics: Metrics | None = None,
+        retry_policy: RetryPolicy | None = None,
+        resume: bool = False,
     ) -> None:
         self.client = client
         self.database = database
         self.delay = max(delay, 0.0)
         self.batch_size = max(batch_size, 1)
+        self.queue_size = max(queue_size, 1)
         self.progress = progress
+        self.metrics = metrics or Metrics()
+        self.retry_policy = retry_policy or RetryPolicy()
+        #: When enabled a run continues after the stored cursor instead of
+        #: re-walking the whole history. Off by default so a repeated collection
+        #: still refreshes views and edits, as it always has.
+        self.resume = resume
 
     # --- entity resolution -------------------------------------------------
     async def resolve(self, target: str) -> Any:
@@ -142,111 +209,204 @@ class TelegramCollector:
         Every run starts at the newest message and pages backwards, so new
         messages are never missed; already stored rows are skipped, which makes
         an interrupted run safe to repeat.
+
+        The history is read by one task and written by another, connected by a
+        bounded queue: the network read and the database commit overlap, and
+        neither side can run away with the other's memory.
+
+        By default the walk still starts at the newest message, so edits and view
+        counts on already stored messages are refreshed. With ``resume=True`` the
+        run continues after the stored cursor instead, which is what makes a
+        repeat run cheap on a large channel.
         """
         entity = await self.resolve(target)
+        label = ""
         with self.database.session() as session:
             chat = store_chat(session, **serializers.chat_fields(entity))
+            label = _chat_label(chat)
             known_max = queries.latest_message_id(session, chat)
-        if known_max:
-            logger.debug("Chat {} already holds messages up to {}", _chat_label(chat), known_max)
+            cursor = load_cursor(session, "telegram", target, "messages") if self.resume else None
+        start_after = self._resume_point(known_max, cursor) if self.resume else None
+        if start_after:
+            logger.debug("Chat {} already holds messages up to {}", label, start_after)
 
-        report = CollectionReport(chat=_chat_label(chat))
-        processed = 0
-        consumed = 0
-        batch: list[Any] = []
-        async for message in self._message_stream(entity, limit=limit):
-            batch.append(message)
-            consumed += 1
-            if len(batch) >= self.batch_size:
-                processed += self._flush_messages(batch, chat, report)
-                batch.clear()
-                await self._progress("messages", processed, limit)
-                await self._sleep()
-            if limit > 0 and consumed >= limit:
-                break
-        if batch:
-            processed += self._flush_messages(batch, chat, report)
-        await self._progress("messages", processed, limit)
-        logger.info(
-            "Collected {} new messages ({} already known)", report.messages, report.duplicated
+        report = CollectionReport(chat=label)
+        writer = BatchWriter(
+            self.database,
+            batch_size=self.batch_size,
+            source="telegram",
+            target=target,
+            section="messages",
         )
-        return report
+        writer.set_target(chat.id, target=target, section="messages")
 
-    def _flush_messages(self, messages: Sequence[Any], chat: Chat, report: CollectionReport) -> int:
-        """Write one batch of messages in a single transaction.
+        queue: BoundedQueue[Any] = BoundedQueue(self.queue_size)
+        failure: list[BaseException] = []
 
-        Returns:
-            The number of messages processed (new + already known).
-        """
-        stored = 0
-        with self.database.session() as session:
-            for message in messages:
-                fields = serializers.message_fields(message)
-                telegram_id = fields["telegram_message_id"]
-                if not telegram_id:
-                    continue
+        async def produce() -> None:
+            """Read the history and enqueue parsed rows, resuming on error.
+
+            When the queue is full the producer *waits*: that is the
+            backpressure, and it keeps memory bounded without ever discarding a
+            message. A transient failure (a dropped connection, a flood wait)
+            restarts the backwards walk from the last id actually enqueued, so a
+            long collection does not restart from the top of the channel.
+            """
+            try:
+                consumed = 0
+                offset = start_after
+                attempt = 0
+                while True:
+                    try:
+                        async for message in self._message_stream(
+                            entity, limit=limit, offset_id=offset
+                        ):
+                            if limit > 0 and consumed >= limit:
+                                return
+                            consumed += 1
+                            offset = _message_id(message) or offset
+                            self.metrics.incr("messages_read")
+                            if queue.depth >= self.queue_size * QUEUE_HIGH_WATER:
+                                self.metrics.incr("backpressure_waits")
+                            # Blocks while the writer catches up: bounded memory,
+                            # no dropped rows.
+                            await queue.put(_parsed_row(message))
+                            await self._sleep()
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - classified below
+                        kind = classify(exc)
+                        if not self.retry_policy.allows(attempt, kind):
+                            raise
+                        delay = self.retry_policy.delay_for(
+                            attempt, server_delay=retry_after_of(exc)
+                        )
+                        attempt += 1
+                        self.metrics.incr("retries")
+                        logger.warning(
+                            "Message stream failed ({}), retry {} in {:.1f}s from offset {}",
+                            kind,
+                            attempt,
+                            delay,
+                            offset,
+                        )
+                        await asyncio.sleep(delay)
+            except BaseException as exc:  # noqa: BLE001 - handed to the consumer
+                failure.append(exc)
+            finally:
+                await queue.put(_SENTINEL)
+
+        async def consume() -> None:
+            """Drain the queue into batches, committing as it goes."""
+            newest = 0
+            processed = 0
+            while True:
+                item = await queue.get()
+                if item is _SENTINEL:
+                    queue.task_done()
+                    break
+                telegram_id, fields, sender, media = item
                 try:
-                    known = queries.get_message(session, chat, telegram_id)
-                    sender = self._store_sender(session, message)
-                    row = store_message(session, chat, **fields, sender=sender)
-                    self._store_media(session, row, serializers.media_entries(message), report)
+                    writer.add_message(fields, sender=sender, media=media)
                 except Exception as exc:  # noqa: BLE001 - one bad row must not stop the run
                     report.errors.append(f"message {telegram_id}: {exc}")
                     logger.warning("Skipping message {}: {}", telegram_id, exc)
+                    queue.task_done()
                     continue
-                if known is None:
-                    report.messages += 1
-                else:
-                    report.duplicated += 1
-                stored += 1
-        return stored
+                newest = max(newest, telegram_id)
+                processed += 1
+                if writer.full:
+                    # The cursor rides along with the rows it covers, so a crash
+                    # can never claim progress that was rolled back.
+                    writer.set_cursor(str(newest))
+                    result = writer.flush()
+                    self._account(result, report)
+                    await self._progress("messages", processed, limit)
+                queue.task_done()
+            writer.set_cursor(str(newest) if newest else None)
+            result = writer.close()
+            self._account(result, report)
+            report.cursor = newest or None
+            await self._progress("messages", processed, limit)
 
-    def _store_sender(self, session: Any, message: Any) -> User | None:
-        entity = getattr(message, "sender", None)
-        if entity is None or getattr(entity, "id", None) is None:
-            return None
-        return store_user(session, **serializers.user_fields(entity))
+        await asyncio.gather(produce(), consume())
+        if failure:
+            raise failure[0]
+        logger.info(
+            "Collected {} new messages ({} already known) in {} batches",
+            report.messages,
+            report.duplicated,
+            report.batches,
+        )
+        return report
 
-    def _store_media(
-        self,
-        session: Any,
-        message: Message,
-        attachments: Sequence[dict[str, Any]],
-        report: CollectionReport,
-    ) -> None:
-        """Add media metadata once per message (metadata only, no download)."""
-        if not attachments or queries.has_media(session, message):
-            return
-        for attachment in attachments:
-            fields = dict(attachment)
-            media_type = str(fields.pop("type", "unknown") or "unknown")
-            queries.add_media(session, message, media_type, **fields)
-            report.media += 1
+    @staticmethod
+    def _resume_point(known_max: int | None, cursor: str | None) -> int | None:
+        """Where to restart the backwards walk.
+
+        The cursor is authoritative when it is at least as new as what the
+        messages table holds; otherwise fall back to the stored maximum.
+        """
+        points = [int(value) for value in (known_max, cursor) if value is not None]
+        return max(points) if points else None
+
+    def _account(self, result: WriteResult, report: CollectionReport) -> None:
+        """Fold one flushed batch into the report and the metrics."""
+        report.messages += result.inserted
+        report.duplicated += result.updated
+        report.media += result.media
+        report.batches += 1
+        self.metrics.incr("messages_written", result.inserted)
+        self.metrics.incr("messages_updated", result.updated)
+        self.metrics.incr("media_written", result.media)
+        self.metrics.observe("batch_rows", report.duplicated + report.messages)
 
     # --- members -----------------------------------------------------------
     async def collect_members(self, target: str, limit: int = 500) -> CollectionReport:
-        """Store the participant list with their role in the chat."""
+        """Store the participant list with their role in the chat.
+
+        Memberships are buffered and written in batches: the old path opened a
+        transaction per member, which for a large group meant thousands of
+        commits for the same handful of rows.
+        """
         entity = await self.resolve(target)
         with self.database.session() as session:
             chat = store_chat(session, **serializers.chat_fields(entity))
 
         report = CollectionReport(chat=_chat_label(chat))
+        writer = BatchWriter(
+            self.database,
+            batch_size=self.batch_size,
+            source="telegram",
+            target=target,
+            section="members",
+        )
+        writer.set_target(chat.id, target=target, section="members")
+
         processed = 0
         async for participant in self._participant_stream(entity, limit=limit):
             user = getattr(participant, "user", participant)
-            if getattr(user, "id", None) is None:
-                continue
-            try:
-                with self.database.session() as session:
-                    stored = store_user(session, **serializers.user_fields(user))
-                    queries.upsert_membership(session, stored, chat, _role_name(participant))
-                report.members += 1
-            except Exception as exc:  # noqa: BLE001
-                report.errors.append(f"member {getattr(user, 'id', '?')}: {exc}")
-                logger.warning("Skipping member: {}", exc)
+            if getattr(user, "id", None) is not None:
+                try:
+                    writer.add_membership(
+                        serializers.user_fields(user), chat.id, _role_name(participant)
+                    )
+                except Exception as exc:  # noqa: BLE001 - one bad member must not stop the run
+                    report.errors.append(f"member {getattr(user, 'id', '?')}: {exc}")
+                    logger.warning("Skipping member: {}", exc)
             processed += 1
+            if writer.full:
+                writer.set_cursor(str(processed))
+                report.members += writer.flush().inserted
+                report.batches += 1
             await self._progress("members", processed, limit)
             await self._sleep()
+        writer.set_cursor(str(processed))
+        report.members += writer.close().inserted
+        report.batches += 1
+        report.cursor = processed or None
+        self.metrics.incr("members_written", report.members)
         await self._progress("members", processed, limit)
         logger.info("Collected {} members", report.members)
         return report

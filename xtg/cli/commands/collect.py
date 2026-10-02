@@ -10,6 +10,7 @@ as metadata only.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import typer
@@ -31,6 +32,11 @@ def collect(
     media: bool = typer.Option(False, "--media", help="Collect media metadata."),
     everything: bool = typer.Option(False, "--all", help="Collect everything available."),
     limit: int = typer.Option(500, "--limit", "-n", min=1, help="Maximum items per section."),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Continue after the stored cursor instead of re-walking the history.",
+    ),
     download: bool = typer.Option(False, "--download", help="Reserved: Phase 3 downloads media."),
     json_output: bool = typer.Option(False, "--json", help="Machine readable summary."),
 ) -> None:
@@ -41,6 +47,7 @@ def collect(
         xtg collect @channel --messages
         xtg collect @channel --members
         xtg collect @channel --all
+        xtg collect @channel --messages --resume
     """
     if not target:
         output.hint("Provide a target: xtg collect @channel --messages")
@@ -59,20 +66,52 @@ def collect(
     app_ctx.settings.require_api_credentials()
     output.progress_note(f"Resolving {target}")
 
-    report = _run_collection(app_ctx, target, sections=sections, limit=limit)
+    report = _run_collection(
+        app_ctx, target, sections=sections, limit=limit, resume=resume, quiet=json_output
+    )
     _render(report, target=target, sections=sections, json_output=json_output)
 
 
-def _run_collection(app_ctx: Any, target: str, *, sections: list[str], limit: int) -> SourceReport:
+def _run_collection(
+    app_ctx: Any,
+    target: str,
+    *,
+    sections: list[str],
+    limit: int,
+    resume: bool,
+    quiet: bool,
+) -> SourceReport:
     """Connect, collect and disconnect through the Telegram source."""
     output.progress_note("Connecting Telegram")
-    with TelegramSource(app_ctx.settings, database=app_ctx.db) as source:
+    settings = app_ctx.settings
+    # The flag wins over the config default so one invocation can be resumed
+    # without editing the environment.
+    settings.resume = resume or settings.resume
+    with TelegramSource(settings, database=app_ctx.db) as source:
+        if not quiet:
+            source.collector.delegate.progress = _progress_printer()
         return source.collect(target, sections=sections, limit=limit)
+
+
+def _progress_printer():
+    """Live progress on one rewritten line, rate limited to 5 updates/second."""
+    state = {"last": 0.0}
+
+    def report(section: str, processed: int, limit: int) -> None:
+        now = time.monotonic()
+        if processed < limit and now - state["last"] < 0.2:
+            return
+        state["last"] = now
+        target = str(limit) if limit else "?"
+        typer.echo(f"  {section}: {processed}/{target}", err=True)
+
+    return report
 
 
 def _render(report: SourceReport, *, target: str, sections: list[str], json_output: bool) -> None:
     """Print the summary block."""
     counts = report.counts
+    details = report.details
     if json_output:
         output.emit_json(
             {
@@ -84,6 +123,7 @@ def _render(report: SourceReport, *, target: str, sections: list[str], json_outp
                 "members": counts.get("members", 0),
                 "media": counts.get("media", 0),
                 "errors": report.errors,
+                "performance": details,
             }
         )
         return
@@ -99,6 +139,9 @@ def _render(report: SourceReport, *, target: str, sections: list[str], json_outp
             ],
         )
     )
+    performance = _performance_rows(details)
+    if performance:
+        output.kv_panel(dict(performance), title="Run")
     if report.errors:
         output.warn(f"{len(report.errors)} item(s) could not be stored:")
         for error in report.errors[:5]:
@@ -107,6 +150,22 @@ def _render(report: SourceReport, *, target: str, sections: list[str], json_outp
         f"Completed: {pluralize(counts.get('messages', 0), 'message')} and "
         f"{pluralize(counts.get('members', 0), 'member')} in {report.target or target}."
     )
+
+
+def _performance_rows(details: dict[str, Any]) -> list[tuple[str, str]]:
+    """Only the metrics that are worth showing, so the panel never lies."""
+    rows: list[tuple[str, str]] = []
+    if details.get("batches"):
+        rows.append(("batches", str(details["batches"])))
+    if details.get("items_per_second"):
+        rows.append(("throughput", f"{details['items_per_second']:,.0f} items/s"))
+    if details.get("retries"):
+        rows.append(("retries", str(details["retries"])))
+    if details.get("backpressure_waits"):
+        rows.append(("backpressure", f"{details['backpressure_waits']:,} waits"))
+    if details.get("cursor"):
+        rows.append(("cursor", str(details["cursor"])))
+    return rows
 
 
 def _validate(target: str) -> tuple[str, str]:
