@@ -145,6 +145,7 @@ def test_collect_unknown_target_exits_not_found(
 def test_collect_without_credentials(cli_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XTG_API_ID")
     monkeypatch.delenv("XTG_API_HASH")
+    reload_settings()
 
     result = runner.invoke(cli_app, ["collect", "@example", "--messages"])
 

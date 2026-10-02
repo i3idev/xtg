@@ -134,7 +134,7 @@ class ClientOptions:
             "proxy": to_telethon_proxy(self.proxy),
             "connection_retries": self.connection_retries,
             "request_retries": self.request_retries,
-            "connect_timeout": self.connect_timeout,
+            "timeout": self.connect_timeout,
         }
 
 
