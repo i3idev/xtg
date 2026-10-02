@@ -20,21 +20,16 @@ Telegram subsystem meet - no proxy parsing is duplicated here.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from xtg.core.config import Settings, get_settings
-from xtg.core.errors import AuthError, ConfigError, NetworkError
+from xtg.core.errors import AuthError, ConfigError, NetworkError, ProxyError
 from xtg.core.logger import logger
+from xtg.proxy import mtproto
 from xtg.proxy.manager import ProxyManager
 from xtg.proxy.parser import ProxyEntry, ProxyType
-
-#: Telegram MTProto secrets always decode to 16 raw bytes.
-MTPROTO_SECRET_BYTES = 16
 
 
 def telethon_available() -> bool:
@@ -52,9 +47,9 @@ def to_telethon_proxy(entry: ProxyEntry | None) -> dict[str, Any] | None:
     Returns ``None`` when no proxy should be used (direct connection).
 
     Telethon expects the MTProto secret as 16 *raw* bytes under ``password``.
-    Telegram hands out the secret base64url encoded (padded or not), and some
-    providers publish it as hex, so both are accepted here. Decoding stays in
-    the Telegram subsystem: the proxy subsystem only stores and masks the string.
+    Decoding follows the reference implementation (hex first, then base64, with
+    ``ee``/``dd`` markers stripped) and lives in :mod:`xtg.proxy.mtproto` so the
+    checker and the client can never disagree about what a secret means.
     """
     if entry is None:
         return None
@@ -64,11 +59,20 @@ def to_telethon_proxy(entry: ProxyEntry | None) -> dict[str, Any] | None:
                 f"MTProto proxy {entry.name} has no secret",
                 hint="Use tg://proxy?server=...&port=...&secret=...",
             )
-        secret_bytes = _decode_mtproto_secret(entry)
+        try:
+            info = mtproto.decode_secret(entry.secret or "")
+        except ProxyError as exc:
+            raise ConfigError(f"Proxy {entry.name} has an unusable secret: {exc}") from exc
+        if not info.checkable:
+            raise ConfigError(
+                f"Proxy {entry.name} uses a {info.kind} secret, which Telethon's "
+                f"plain MTProxy connection cannot use",
+                hint="Only 16-byte obfuscated2 secrets are supported.",
+            )
         return {
             "proxy_type": "mtproto",
             "addr": (entry.host, entry.port),
-            "password": secret_bytes,
+            "password": info.key,
         }
     types = {
         ProxyType.HTTP: "http",
@@ -90,39 +94,6 @@ def to_telethon_proxy(entry: ProxyEntry | None) -> dict[str, Any] | None:
         payload["username"] = entry.username or ""
         payload["password"] = entry.password or ""
     return payload
-
-
-def _decode_mtproto_secret(entry: ProxyEntry) -> bytes:
-    """Return the 16 raw bytes of an MTProto proxy secret.
-
-    Telegram publishes secrets base64url encoded with or without padding; some
-    providers publish hex instead, so both encodings are attempted.
-
-    Raises:
-        ConfigError: when the secret is not decodable or does not decode to
-            exactly :data:`MTPROTO_SECRET_BYTES` bytes.
-    """
-    secret = entry.secret or ""
-    padded = secret + "=" * (-len(secret) % 4)
-    candidates: list[bytes] = []
-    for url_safe in (True, False):
-        value = padded.translate(bytes.maketrans(b"-_", b"+/")) if url_safe else padded
-        try:
-            candidates.append(base64.b64decode(value, validate=True))
-        except (binascii.Error, ValueError):
-            continue
-    with contextlib.suppress(ValueError):  # hex is the fallback encoding
-        candidates.append(bytes.fromhex(secret))
-
-    for candidate in candidates:
-        if len(candidate) == MTPROTO_SECRET_BYTES:
-            return candidate
-    sizes = sorted({len(candidate) for candidate in candidates})
-    raise ConfigError(
-        f"MTProto proxy {entry.name} has a secret that decodes to "
-        f"{sizes or 'no'} bytes, expected {MTPROTO_SECRET_BYTES}",
-        hint="The secret must be 16 bytes, base64 or hex encoded.",
-    )
 
 
 def select_proxy(settings: Settings | None = None) -> ProxyEntry | None:

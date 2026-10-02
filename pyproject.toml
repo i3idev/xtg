@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
     "loguru>=0.7",
     "praw>=7.7",
+    "pycryptodome>=3.20",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
@@ -30,6 +31,12 @@ dependencies = [
 # Telethon and PRAW are imported lazily (xtg.telegram.client.create_client and
 # xtg.sources.reddit.client.create_reddit) so the CLI keeps working for every
 # command that does not open a live connection to the platform.
+#
+# pycryptodome provides AES-256-CTR, which the MTProto obfuscated2 transport
+# needs for its handshake key schedule. It is the crypto backend Telethon itself
+# uses. The import is lazy as well: without it `xtg proxy check` still reports
+# classical proxies, and reports MTProto entries as "unsupported" instead of
+# failing.
 
 [project.scripts]
 xtg = "xtg.cli.main:run"
@@ -60,6 +67,9 @@ dev = [
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 asyncio_mode = "strict"
+markers = [
+    "integration: needs a real endpoint (MTProto proxy, Telegram, Reddit); see XTG_* env vars",
+]
 filterwarnings = ["error::DeprecationWarning:xtg.*"]
 
 # Type checking foundation. Pyright is used because the codebase relies on

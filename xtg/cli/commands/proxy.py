@@ -13,7 +13,7 @@ from xtg.core.config import mask_secret
 from xtg.core.errors import ExitCode
 from xtg.proxy.checker import ProxyCheckResult
 from xtg.proxy.manager import ProxyManager
-from xtg.proxy.parser import ProxyEntry
+from xtg.proxy.parser import ProxyEntry, ProxyType
 
 app = typer.Typer(
     name="proxy",
@@ -128,6 +128,11 @@ def check(
         )
         alive = sum(1 for result in results if result.alive)
         output.info(f"{alive}/{len(results)} proxies usable.")
+        # Protocol level detail for MTProto entries: silence means the proxy
+        # accepted the handshake, a hang-up means it rejected it.
+        for result in results:
+            if result.detail and result.entry.type is ProxyType.MTPROTO:
+                output.info(f"{result.entry.name}: {result.detail}")
 
     if any(result.alive for result in results):
         return
@@ -226,4 +231,5 @@ def _result_payload(result: ProxyCheckResult) -> dict[str, Any]:
         "status": result.status,
         "latency_ms": round(result.latency_ms, 2) if result.latency_ms else None,
         "error": result.error,
+        "detail": result.detail,
     }

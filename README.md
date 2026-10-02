@@ -253,11 +253,38 @@ the secret is masked everywhere except the canonical `url` used to write the
 list file back. Invalid entries are reported by `xtg proxy list` instead of
 aborting the run.
 
-`xtg proxy check` connects with TCP for the classical schemes. An MTProto proxy
-is only reported as `alive` when it also answers an obfuscated handshake, so an
-open port alone is never treated as a working proxy. Statuses are `alive`,
-`dead` (nothing listening or the handshake failed), `invalid` (cannot work as
-configured, e.g. a missing secret), `unsupported` (unknown scheme) and `error`.
+`xtg proxy check` connects with TCP for the classical schemes. MTProto proxies are
+checked by speaking their transport (`xtg/proxy/mtproto.py`, a byte-compatible
+port of Telethon's `MTProxyIO`):
+
+* the 64 byte obfuscated2 initiation is sent, with AES-256-CTR keys derived as
+  `sha256(header[8:40] + secret)` - the secret is part of the key schedule, so a
+  proxy configured with a different secret cannot decrypt the message that
+  follows;
+* a real `req_pq_multi` message is sent behind it, framed for the abridged
+  codec. No Telegram account, session or authorization key is involved;
+* an MTProto proxy **never answers a handshake** - it waits for a message it can
+  forward - so staying connected is the success case, and being hung up on is
+  the failure. That is the same criterion Telethon uses after connecting.
+
+Statuses are `alive`, `dead` (nothing listening, or the proxy hung up),
+`invalid` (cannot work as configured, e.g. a missing secret), `unsupported`
+(unknown scheme, a fake-TLS/`ee` secret, or `pycryptodome` not installed) and
+`error`. Use `xtg proxy check --json` or the per-entry detail line for the
+protocol level reason.
+
+To probe a real endpoint without touching the list file:
+
+```bash
+uv run python -m xtg.proxy "tg://proxy?server=host.tld&port=443&secret=..."
+XTG_MTPROXY_URI="tg://proxy?..." uv run python -m xtg.proxy --settle 5
+```
+
+Or run the integration test, which skips itself unless a URI is provided:
+
+```bash
+XTG_MTPROXY_URI="tg://proxy?..." uv run pytest -m integration
+```
 
 ### `xtg db`
 
