@@ -1,13 +1,15 @@
 """``xtg collect`` - Telegram data collection.
 
-Runs the Phase 2 collector: resolves the entity, stores the chat, walks the
-message history and/or the participant list, and writes everything through the
-idempotent upsert helpers. Media is recorded as metadata only.
+Runs the Phase 2 collector through the Telegram source
+(:mod:`xtg.sources.telegram`), which presents the async Telethon collector as
+the generic :class:`~xtg.sources.base.BaseSource` contract: it resolves the
+entity, stores the chat, walks the message history and/or the participant list,
+and writes everything through the idempotent upsert helpers. Media is recorded
+as metadata only.
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import typer
@@ -16,7 +18,8 @@ from xtg.cli import output
 from xtg.cli.context import get_app_context
 from xtg.core.errors import ExitCode
 from xtg.core.utils import normalize_entity_ref, pluralize
-from xtg.telegram.collector import CollectionReport, TelegramCollector
+from xtg.sources.base import SourceReport
+from xtg.sources.telegram import TelegramSource
 
 
 @output.handle_errors
@@ -53,72 +56,46 @@ def collect(
         output.warn("Media downloads are not implemented yet; metadata is stored instead.")
 
     app_ctx = get_app_context(ctx)
-    settings = app_ctx.settings
-    settings.require_api_credentials()
+    app_ctx.settings.require_api_credentials()
+    output.progress_note(f"Resolving {target}")
 
-    report = asyncio.run(_run_collection(app_ctx, target, sections=sections, limit=limit))
+    report = _run_collection(app_ctx, target, sections=sections, limit=limit)
     _render(report, target=target, sections=sections, json_output=json_output)
 
 
-async def _run_collection(
-    app_ctx: Any, target: str, *, sections: list[str], limit: int
-) -> CollectionReport:
-    """Connect, collect, disconnect."""
-    settings = app_ctx.settings
+def _run_collection(app_ctx: Any, target: str, *, sections: list[str], limit: int) -> SourceReport:
+    """Connect, collect and disconnect through the Telegram source."""
     output.progress_note("Connecting Telegram")
-    connection = app_ctx.connection()
-    try:
-        client = await connection.open()
-        output.progress_note(f"Using proxy: {connection.options.proxy_url}")
-        collector = TelegramCollector(
-            client,
-            app_ctx.db,
-            delay=settings.request_delay,
-            progress=_progress_reporter(),
-        )
-        output.progress_note(f"Resolving {target}")
-        return await collector.run(target, sections=sections, limit=limit)
-    finally:
-        await connection.close()
+    with TelegramSource(app_ctx.settings, database=app_ctx.db) as source:
+        return source.collect(target, sections=sections, limit=limit)
 
 
-def _progress_reporter() -> Any:
-    """Rich progress line for long running walks."""
-
-    def report(section: str, processed: int, limit: int) -> None:
-        if processed and processed % 100 == 0:
-            output.progress_note(f"  {section}: {processed}/{limit}")
-
-    return report
-
-
-def _render(
-    report: CollectionReport, *, target: str, sections: list[str], json_output: bool
-) -> None:
+def _render(report: SourceReport, *, target: str, sections: list[str], json_output: bool) -> None:
     """Print the summary block."""
+    counts = report.counts
     if json_output:
         output.emit_json(
             {
                 "target": target,
                 "sections": sections,
-                "chat": report.chat,
-                "messages": report.messages,
+                "chat": report.target,
+                "messages": counts.get("messages", 0),
                 "duplicated": report.duplicated,
-                "members": report.members,
-                "media": report.media,
+                "members": counts.get("members", 0),
+                "media": counts.get("media", 0),
                 "errors": report.errors,
             }
         )
         return
 
-    output.heading(f"Collected {report.chat or target}", subtitle=", ".join(sections))
+    output.heading(f"Collected {report.target or target}", subtitle=", ".join(sections))
     output.print_table(
         output.table(
             columns=("SECTION", "SAVED", "SKIPPED"),
             rows=[
-                ("messages", str(report.messages), str(report.duplicated)),
-                ("members", str(report.members), "-"),
-                ("media", str(report.media), "-"),
+                ("messages", str(counts.get("messages", 0)), str(report.duplicated)),
+                ("members", str(counts.get("members", 0)), "-"),
+                ("media", str(counts.get("media", 0)), "-"),
             ],
         )
     )
@@ -127,8 +104,8 @@ def _render(
         for error in report.errors[:5]:
             output.hint(f"  - {error}")
     output.success(
-        f"Completed: {pluralize(report.messages, 'message')} and "
-        f"{pluralize(report.members, 'member')} in {report.chat or target}."
+        f"Completed: {pluralize(counts.get('messages', 0), 'message')} and "
+        f"{pluralize(counts.get('members', 0), 'member')} in {report.target or target}."
     )
 
 
