@@ -1,9 +1,15 @@
 {
   "proxys": {
-    "P1": "socks5://127.0.0.1:1080",
-    "P2": "socks5://127.0.0.1:1081",
-    "P3": "127.0.0.1:1082:user:password",
-    "P4": "http://127.0.0.1:8080",
-    "P5": "socks5://127.0.0.1:1083:user:password"
+    "P1": "tg://proxy?server=gov.grasic.info&port=8443&secret=EERighJJvXrFGRMCIMjdCQ",
+    "P2": "tg://proxy?server=eyiran.suser.ir&port=2020&secret=AAAAAAAAAAAAAAAAAAAAAA%3D%3D",
+    "P3": "tg://proxy?server=ir.simpleelegance-us.info&port=8443&secret=EERighJJvXrFGRMCIMjdCQ",
+    "P4": "tg://proxy?server=ir.pbdjarum.info&port=8443&secret=EERighJJvXrFGRMCIMjdCQ",
+    "P5": "tg://proxy?server=ir.flipme.info&port=8443&secret=EERighJJvXrFGRMCIMjdCQ",
+    "P6": "tg://proxy?server=208.87.242.223&port=8443&secret=EERighJJvXrFGRMCIMjdCQ",
+    "P7": "tg://proxy?server=eyiran1.suser.ir&port=2020&secret=AAAAAAAAAAAAAAAAAAAAAA%3D%3D",
+    "P8": "tg://proxy?server=2.27.12.116&port=443&secret=7hkTDGlc9pnZP1ox7POA1EJtdC5za290b2Jhei5ydQ",
+    "P9": "tg://proxy?server=87.248.129.221&port=443&secret=ee1603010200010001fc030386e24c3add626973636f7474692e79656b74616e65742e636f6d",
+    "P10": "tg://proxy?server=eyiran33.suser.ir&port=2020&secret=AAAAAAAAAAAAAAAAAAAAAA%3D%3D",
+    "P11": "tg://proxy?server=eyiran35.suser.ir&port=2020&secret=AAAAAAAAAAAAAAAAAAAAAA%3D%3D"
   }
 }
