@@ -133,10 +133,12 @@ def test_reported_size_matches_the_file_on_disk(settings: Settings) -> None:
 
 
 def test_describe_session_without_files(settings: Settings) -> None:
+    """A missing file is ``MISSING``, not "Telegram is not authorized"."""
     info = telegram_auth.describe_session(settings)
     assert info.exists is False
     assert info.size_bytes == 0
-    assert info.state is telegram_auth.AuthState.NOT_AUTHORIZED
+    assert info.state is telegram_auth.AuthState.MISSING
+    assert telegram_auth.auth_state(settings) is telegram_auth.AuthState.MISSING
     assert telegram_auth.session_files(settings) == []
 
 
@@ -160,8 +162,8 @@ def test_a_file_that_is_not_a_session_is_not_reported_as_authorized(
 
     assert info.exists is True
     assert info.valid is False
-    assert info.state is telegram_auth.AuthState.NOT_AUTHORIZED
-    assert telegram_auth.auth_state(settings) is telegram_auth.AuthState.NOT_AUTHORIZED
+    assert info.state is telegram_auth.AuthState.INVALID
+    assert telegram_auth.auth_state(settings) is telegram_auth.AuthState.INVALID
 
 
 def test_an_empty_session_file_is_not_a_session(settings: Settings) -> None:
@@ -233,6 +235,64 @@ def test_probe_a_valid_authorized_session(settings: Settings) -> None:
     assert info.valid is True
     assert info.authorized is True
     assert info.state is telegram_auth.AuthState.AUTHORIZED
+
+
+def test_every_distinct_session_state_is_reported_separately(
+    settings: Settings,
+) -> None:
+    """The four states the CLI must never conflate.
+
+    Regression: a missing file used to be reported as ``not_authorized``, which
+    made a fresh install look like a failed login.
+    """
+    path = telegram_auth.session_path(settings)
+
+    # 1. no file at all
+    assert telegram_auth.describe_session(settings).state is telegram_auth.AuthState.MISSING
+
+    # 2. a file that is present but unusable
+    path.write_bytes(b"not a session at all")
+    assert telegram_auth.describe_session(settings).state is telegram_auth.AuthState.INVALID
+
+    # 3. a valid session nobody has logged in with yet
+    write_session_file(path, authorized=False)
+    info = telegram_auth.describe_session(settings)
+    assert info.valid is True
+    assert info.state is telegram_auth.AuthState.NOT_AUTHORIZED
+
+    # 4. a valid, authorized session
+    write_session_file(path, authorized=True)
+    info = telegram_auth.describe_session(settings)
+    assert info.state is telegram_auth.AuthState.AUTHORIZED
+
+    # and the four are four distinct values, not aliases
+    states = {
+        telegram_auth.AuthState.MISSING,
+        telegram_auth.AuthState.INVALID,
+        telegram_auth.AuthState.NOT_AUTHORIZED,
+        telegram_auth.AuthState.AUTHORIZED,
+    }
+    assert len({state.value for state in states}) == 4
+
+
+def test_every_command_resolves_one_session_path(settings: Settings, tmp_path: Path) -> None:
+    """``<home>/data/sessions/<session_name>.session``, whatever the command."""
+    from xtg.telegram.client import resolve_options
+
+    expected = settings.sessions_path / f"{settings.session_name}.session"
+    assert expected.name == "xtg.session"
+
+    login_path = Path(resolve_options(settings).as_kwargs()["session"])  # login
+    status_path = telegram_auth.session_path(settings)  # status
+    logout_targets = telegram_auth.session_files(settings)  # logout
+    harden_targets = telegram_auth.harden_session_files(settings)  # validator
+
+    assert login_path == status_path == expected
+    assert harden_targets == logout_targets == []
+
+    write_session_file(expected)
+    assert telegram_auth.session_files(settings) == [expected]
+    assert telegram_auth.harden_session_files(settings) == [expected]
 
 
 def test_the_validator_accepts_a_session_written_by_telethon_1_45(

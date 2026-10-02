@@ -27,11 +27,25 @@ from xtg.core.logger import logger
 
 
 class AuthState(StrEnum):
-    """Coarse authentication state derived from local files."""
+    """Coarse authentication state derived from local files.
 
+    The states are deliberately distinct. "There is no session file" is a very
+    different fact from "Telegram has this device authorized": collapsing them
+    makes a fresh install look like a failed login, and hides a corrupt or
+    hand-edited session behind the same message as an ordinary one.
+    """
+
+    #: No API credentials configured, so nothing can be checked.
     UNCONFIGURED = "unconfigured"
+    #: No session file at all - never logged in, or it was deleted.
+    MISSING = "missing"
+    #: A file exists but is not a usable Telethon session.
+    INVALID = "invalid"
+    #: A valid Telethon session that holds no authorization yet.
     NOT_AUTHORIZED = "not_authorized"
+    #: A valid Telethon session holding an auth key.
     AUTHORIZED = "authorized"
+    #: A rollback journal is present, so another process has it open.
     LOCKED = "locked"
 
 
@@ -57,8 +71,18 @@ class SessionInfo:
 
     @property
     def state(self) -> AuthState:
+        """The most specific state the file on disk supports.
+
+        Each branch answers a different question, and keeping them apart is what
+        stops "no session file" from being reported as "Telegram is not
+        authorized".
+        """
         if self.locked:
             return AuthState.LOCKED
+        if not self.exists:
+            return AuthState.MISSING
+        if not self.valid:
+            return AuthState.INVALID
         return AuthState.AUTHORIZED if self.authorized else AuthState.NOT_AUTHORIZED
 
 

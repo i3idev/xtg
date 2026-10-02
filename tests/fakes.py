@@ -285,6 +285,9 @@ def write_session_file(
     freshly created, never-logged-in session looks like on disk.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Start clean: writing over an existing database would collide on the
+    # tables, which is not what any caller of this helper is testing.
+    path.unlink(missing_ok=True)
     with sqlite3.connect(path) as connection:
         for statement in TELETHON_SCHEMA:
             connection.execute(statement)

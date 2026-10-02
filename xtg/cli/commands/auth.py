@@ -68,6 +68,7 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
         output.emit_json(payload)
         return
 
+    state = telegram_auth.auth_state(settings)
     output.kv_panel(
         {
             "version": __version__,
@@ -84,15 +85,15 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
     )
     if not payload["configured"]:
         output.hint(f"Set XTG_API_ID and XTG_API_HASH in {settings.env_file} (see .env.example).")
-    elif not info.exists:
-        output.hint("No session found yet - run `xtg auth login`.")
-    elif not info.valid:
-        output.warn(f"{info.path.name} is not a Telegram session file ({info.problem}).")
+    elif state is telegram_auth.AuthState.MISSING:
+        output.hint(f"No session at {info.path} yet - run `xtg auth login`.")
+    elif state is telegram_auth.AuthState.INVALID:
+        output.warn(f"{info.path.name} is not a usable Telegram session ({info.problem}).")
         output.hint("Run `xtg auth logout` then `xtg auth login` to rebuild it.")
-    elif info.valid and not info.authorized:
+    elif state is telegram_auth.AuthState.NOT_AUTHORIZED:
         output.warn(f"{info.path.name} holds no authorization yet.")
         output.hint("Run `xtg auth login` to authorize this session.")
-    elif info.locked:
+    elif state is telegram_auth.AuthState.LOCKED:
         output.warn("The session is in use by another xtg process.")
     if files:
         output.heading("Session files")

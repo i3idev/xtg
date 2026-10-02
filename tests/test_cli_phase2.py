@@ -450,8 +450,26 @@ def test_auth_status_rejects_a_file_that_is_not_a_session(
     assert result.exit_code == 0
     data = payload(result)
     assert data["session_exists"] is True
-    assert data["state"] == "not_authorized"
+    assert data["session_valid"] is False
+    assert data["state"] == "invalid"
     assert data["authorized"] is False
+
+
+def test_auth_status_reports_a_missing_session_as_missing(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    """No file is a different fact from "Telegram is not authorized"."""
+    result = runner.invoke(cli_app, ["auth", "status", "--json"])
+
+    assert result.exit_code == 0
+    data = payload(result)
+    assert data["session_exists"] is False
+    assert data["session_valid"] is False
+    assert data["state"] == "missing"
+    assert data["authorized"] is False
+
+    table = runner.invoke(cli_app, ["auth", "status"])
+    assert "run `xtg auth login`" in table.output
 
 
 def test_auth_status_warns_about_a_broken_session(
@@ -464,7 +482,7 @@ def test_auth_status_warns_about_a_broken_session(
     result = runner.invoke(cli_app, ["auth", "status"])
 
     assert result.exit_code == 0
-    assert "not a Telegram session file" in result.output
+    assert "not a usable Telegram session" in result.output
 
 
 def test_auth_status_table_with_session(
