@@ -1,4 +1,4 @@
-"""eXtractorT - Telegram Intelligence & Extraction Toolkit."""
+"""eXtractorT - Social Media Intelligence & Extraction Toolkit."""
 
 from __future__ import annotations
 
