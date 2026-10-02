@@ -7,7 +7,10 @@ needed; the Telegram client is injected where ``create_client`` is called.
 from __future__ import annotations
 
 import json
+import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -322,7 +325,7 @@ def test_auth_login_hardens_session_files(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
     """The fake client writes a session file, login must lock it down."""
-    session = isolated_home / "data" / "sessions" / "xtg"
+    session = isolated_home / "data" / "sessions" / "xtg.session"
 
     class Writing(FakeClient):
         async def connect(self) -> FakeClient:
@@ -344,7 +347,7 @@ def test_auth_login_hardens_session_files(
 def test_auth_status_reports_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    write_session_file(isolated_home / "data" / "sessions" / "xtg")
+    write_session_file(isolated_home / "data" / "sessions" / "xtg.session")
 
     result = runner.invoke(cli_app, ["auth", "status", "--json"])
 
@@ -357,11 +360,88 @@ def test_auth_status_reports_session(
     assert data["authorized"] is True
 
 
+def test_auth_status_reports_the_same_file_the_service_layer_resolves(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    """The command must not report a different session than the library returns.
+
+    Regression: status looked for ``xtg`` while Telethon had written
+    ``xtg.session``, so a successful login was reported as ``0 B`` and
+    ``not_authorized``.
+    """
+    expected = write_session_file(isolated_home / "data" / "sessions" / "xtg.session")
+
+    result = runner.invoke(cli_app, ["auth", "status", "--json"])
+    assert result.exit_code == 0
+    data = payload(result)
+
+    assert data["session_file"] == str(expected)
+    assert data["session_files"] == [str(expected)]
+    assert data["session_size_bytes"] == expected.stat().st_size
+    assert data["session_valid"] is True
+    assert data["state"] == "authorized"
+
+
+def test_auth_status_reports_an_unauthorized_session_distinctly(
+    cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    """A session file with no auth key is valid, but nobody is logged in."""
+    write_session_file(isolated_home / "data" / "sessions" / "xtg.session", authorized=False)
+
+    result = runner.invoke(cli_app, ["auth", "status", "--json"])
+    data = payload(result)
+
+    assert data["session_valid"] is True
+    assert data["authorized"] is False
+    assert data["state"] == "not_authorized"
+
+    table = runner.invoke(cli_app, ["auth", "status"])
+    assert "holds no authorization yet" in table.output
+
+
+def test_auth_status_from_a_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end: run the console entry point and check what it reports.
+
+    Uses an isolated ``XTG_HOME`` and a synthetic session, so no real
+    credentials and no network are involved.
+    """
+    home = tmp_path / "home"
+    session = write_session_file(home / "data" / "sessions" / "xtg.session")
+    env = {
+        **os.environ,
+        "XTG_HOME": str(home),
+        "XTG_API_ID": "12345",
+        "XTG_API_HASH": "hash",
+        "XTG_LOG_TO_FILE": "false",
+        "XTG_PROXY_ENABLED": "false",
+    }
+    # A stray .env next to the CWD must not influence the result.
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    (workdir / ".env").write_text("XTG_SESSION_NAME=leaked\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "xtg.cli.main", "auth", "status", "--json"],
+        capture_output=True,
+        text=True,
+        cwd=workdir,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    data = json.loads(completed.stdout)
+    assert data["session_file"] == str(session)
+    assert data["state"] == "authorized"
+    assert data["authorized"] is True
+    assert data["session_size_bytes"] == session.stat().st_size
+
+
 def test_auth_status_rejects_a_file_that_is_not_a_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
     """Regression: a junk file used to be reported as an authorized account."""
-    session = isolated_home / "data" / "sessions" / "xtg"
+    session = isolated_home / "data" / "sessions" / "xtg.session"
     session.parent.mkdir(parents=True, exist_ok=True)
     session.write_bytes(b"not a session")
 
@@ -377,7 +457,7 @@ def test_auth_status_rejects_a_file_that_is_not_a_session(
 def test_auth_status_warns_about_a_broken_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    session = isolated_home / "data" / "sessions" / "xtg"
+    session = isolated_home / "data" / "sessions" / "xtg.session"
     session.parent.mkdir(parents=True, exist_ok=True)
     session.write_bytes(b"not a session")
 
@@ -390,7 +470,7 @@ def test_auth_status_warns_about_a_broken_session(
 def test_auth_status_table_with_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    write_session_file(isolated_home / "data" / "sessions" / "xtg")
+    write_session_file(isolated_home / "data" / "sessions" / "xtg.session")
 
     result = runner.invoke(cli_app, ["auth", "status"])
 
@@ -402,7 +482,7 @@ def test_auth_status_table_with_session(
 def test_auth_logout_removes_session(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    session = isolated_home / "data" / "sessions" / "xtg"
+    session = isolated_home / "data" / "sessions" / "xtg.session"
     session.parent.mkdir(parents=True, exist_ok=True)
     session.write_bytes(b"session")
 
@@ -415,7 +495,7 @@ def test_auth_logout_removes_session(
 def test_auth_logout_cancelled(
     cli_app: Any, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
 ) -> None:
-    session = isolated_home / "data" / "sessions" / "xtg"
+    session = isolated_home / "data" / "sessions" / "xtg.session"
     session.parent.mkdir(parents=True, exist_ok=True)
     session.write_bytes(b"session")
 

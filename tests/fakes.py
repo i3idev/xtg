@@ -241,22 +241,77 @@ def make_chat() -> FakeChat:
     )
 
 
-def write_session_file(path: Path, *, dc_id: int = 2, port: int = 443) -> Path:
-    """Create a file shaped like a real Telethon session database.
+#: The schema Telethon 1.45 creates, verbatim. Kept here so tests build files
+#: the validator has to agree with, instead of a convenient approximation.
+TELETHON_SCHEMA = (
+    "CREATE TABLE version (version integer primary key)",
+    """CREATE TABLE sessions (
+        dc_id integer primary key,
+        server_address text,
+        port integer,
+        auth_key blob,
+        takeout_id integer,
+        tmp_auth_key blob
+    )""",
+    "CREATE TABLE entities (id integer primary key, hash integer not null,"
+    " username text, phone integer, name text, date integer)",
+    "CREATE TABLE sent_files (md5_digest blob, file_size integer, type integer,"
+    " id integer, hash integer, primary key(md5_digest, file_size, type))",
+    "CREATE TABLE update_state (id integer primary key, pts integer, qts integer,"
+    " date integer, seq integer)",
+)
 
-    Telethon stores the auth key in a SQLite database with a ``sessions`` table.
-    ``xtg auth status`` checks for exactly that, so tests that need a session to
-    look authorized must build one instead of writing arbitrary bytes - writing
-    junk used to be enough to make the CLI claim the account was logged in.
+#: ``SQLiteSession.CURRENT_VERSION`` in Telethon 1.45.
+TELETHON_SCHEMA_VERSION = 8
+
+#: A structurally valid key that carries no meaning. Never a real auth key.
+FAKE_AUTH_KEY = bytes(range(256))
+
+
+def write_session_file(
+    path: Path,
+    *,
+    authorized: bool = True,
+    dc_id: int = 2,
+    port: int = 443,
+    version: int = TELETHON_SCHEMA_VERSION,
+) -> Path:
+    """Create a file shaped exactly like a real Telethon session database.
+
+    Telethon appends ``.session`` to the session id, so tests must pass the
+    same path the application resolves (``<home>/data/sessions/<name>.session``).
+
+    ``authorized=False`` writes the tables but no auth key, which is what a
+    freshly created, never-logged-in session looks like on disk.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as connection:
-        connection.execute(
-            "CREATE TABLE sessions (dc_id INTEGER PRIMARY KEY, server_address TEXT, port INTEGER,"
-            " auth_key BLOB)"
-        )
-        connection.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?)",
-            (dc_id, "149.154.167.51", port, bytes(range(256))),
-        )
+        for statement in TELETHON_SCHEMA:
+            connection.execute(statement)
+        connection.execute("INSERT INTO version VALUES (?)", (version,))
+        if authorized:
+            connection.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)",
+                (dc_id, "149.154.167.92", port, FAKE_AUTH_KEY, None, None),
+            )
+        connection.commit()
+    return path
+
+
+def write_corrupt_sqlite(path: Path) -> Path:
+    """A file that starts like SQLite but is truncated mid-page."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    good = write_session_file(path)
+    blob = good.read_bytes()
+    good.write_bytes(blob[: len(blob) // 3])
+    return path
+
+
+def write_unrelated_sqlite(path: Path) -> Path:
+    """A perfectly valid SQLite database that is not a Telegram session."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE notes (id integer primary key, body text)")
+        connection.execute("INSERT INTO notes (body) VALUES ('hello')")
+        connection.commit()
     return path

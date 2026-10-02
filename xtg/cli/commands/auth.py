@@ -60,8 +60,9 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
         "session_size_bytes": info.size_bytes,
         "session_mode": info.mode,
         "session_locked": info.locked,
+        "session_valid": info.valid,
         "state": telegram_auth.auth_state(settings),
-        "authorized": info.valid and settings.has_api_credentials,
+        "authorized": info.authorized and settings.has_api_credentials,
     }
     if json_output:
         output.emit_json(payload)
@@ -75,7 +76,7 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
             "api hash": payload["api_hash"] or "not set",
             "session name": settings.session_name,
             "session file": payload["session_file"],
-            "session size": format_size(info.size_bytes) if files else "-",
+            "session size": format_size(info.size_bytes) if info.exists else "-",
             "permissions": info.mode,
             "authorized": "yes" if payload["authorized"] else "no",
         },
@@ -83,11 +84,14 @@ def status(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")
     )
     if not payload["configured"]:
         output.hint(f"Set XTG_API_ID and XTG_API_HASH in {settings.env_file} (see .env.example).")
-    elif not files:
+    elif not info.exists:
         output.hint("No session found yet - run `xtg auth login`.")
     elif not info.valid:
-        output.warn(f"{info.path.name} is not a Telegram session file.")
+        output.warn(f"{info.path.name} is not a Telegram session file ({info.problem}).")
         output.hint("Run `xtg auth logout` then `xtg auth login` to rebuild it.")
+    elif info.valid and not info.authorized:
+        output.warn(f"{info.path.name} holds no authorization yet.")
+        output.hint("Run `xtg auth login` to authorize this session.")
     elif info.locked:
         output.warn("The session is in use by another xtg process.")
     if files:

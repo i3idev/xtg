@@ -50,6 +50,24 @@ def _home_from_env() -> Path | None:
     return Path(raw).expanduser().resolve() if raw else None
 
 
+#: Telethon stores a session in a SQLite database and appends this to the name.
+SESSION_EXTENSION = ".session"
+
+
+def session_filename(name: str) -> str:
+    """Session name to session file name, exactly once.
+
+    Telethon's ``SQLiteSession`` appends ``.session`` to any session id that
+    does not already end with it, so a name may legitimately be configured with
+    or without the suffix. This returns the file name either way, which keeps
+    the lookup idempotent and avoids ``xtg.session.session``.
+    """
+    cleaned = name.strip()
+    if cleaned.lower().endswith(SESSION_EXTENSION):
+        cleaned = cleaned[: -len(SESSION_EXTENSION)]
+    return cleaned + SESSION_EXTENSION
+
+
 class Settings(BaseSettings):
     """Typed application settings."""
 
@@ -99,7 +117,11 @@ class Settings(BaseSettings):
     # clearer to reject here than as an opaque error from the API later.
     api_id: int | None = Field(default=None, ge=1, description="Telegram API id.")
     api_hash: str | None = Field(default=None, repr=False, description="Telegram API hash.")
-    session_name: str = Field(default="xtg", description="Telethon session name.")
+    session_name: str = Field(
+        default="xtg",
+        min_length=1,
+        description="Telethon session name (the .session suffix is added for you).",
+    )
 
     # --- Reddit ------------------------------------------------------------
     # Both spellings are accepted: the bare REDDIT_* names used by PRAW's own
@@ -200,6 +222,19 @@ class Settings(BaseSettings):
         default=30.0, gt=0.0, description="Cap for a computed backoff delay."
     )
 
+    @field_validator("home", mode="after")
+    @classmethod
+    def _anchor_home(cls, value: Path) -> Path:
+        """Make ``home`` absolute so derived paths do not follow the CWD.
+
+        Every runtime path is built as ``home / <relative>``. If ``home`` itself
+        were relative, ``data/sessions/xtg.session`` would resolve against
+        whatever directory the process happened to be started from, and the same
+        configuration would point at different files from different shells.
+        """
+        expanded = value.expanduser()
+        return expanded if expanded.is_absolute() else Path.cwd() / expanded
+
     @field_validator("max_concurrency", mode="after")
     @classmethod
     def _at_least_min_concurrency(cls, value: int, info: Any) -> int:
@@ -269,7 +304,15 @@ class Settings(BaseSettings):
 
     @property
     def session_file(self) -> Path:
-        return self.sessions_path / self.session_name
+        """The SQLite file Telethon actually reads and writes.
+
+        Telethon appends ``.session`` to whatever session id it is given (see
+        ``SQLiteSession.__init__``), so the artifact on disk is
+        ``<name>.session``. Everything here resolves that name the same way
+        login, status and logout do, instead of pointing at the bare stem that
+        Telethon never creates.
+        """
+        return self.sessions_path / session_filename(self.session_name)
 
     # --- Helpers -----------------------------------------------------------
     def _resolve(self, path: Path) -> Path:

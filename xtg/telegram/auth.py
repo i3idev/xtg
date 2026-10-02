@@ -37,12 +37,13 @@ class AuthState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
-    """Where the session lives and whether it looks usable.
+    """Where the session lives and what it actually is.
 
     ``exists`` only says a file is there. ``valid`` says it is a Telethon
-    session database, which is what :meth:`state` and the ``xtg auth status``
-    report rely on: a leftover or truncated file is present but useless, and
-    reporting it as "authorized" sends the user looking for the wrong problem.
+    session database and ``authorized`` says it also holds an auth key, which
+    is what :meth:`state` and the ``xtg auth status`` report rely on: a leftover
+    or truncated file is present but useless, and reporting it as "authorized"
+    sends the user looking for the wrong problem.
     """
 
     path: Path
@@ -51,12 +52,14 @@ class SessionInfo:
     size_bytes: int
     mode: str = "-rw-r--r--"
     valid: bool = False
+    authorized: bool = False
+    problem: str = ""
 
     @property
     def state(self) -> AuthState:
         if self.locked:
             return AuthState.LOCKED
-        return AuthState.AUTHORIZED if self.valid else AuthState.NOT_AUTHORIZED
+        return AuthState.AUTHORIZED if self.authorized else AuthState.NOT_AUTHORIZED
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +98,12 @@ class Prompter(Protocol):
 
 
 def session_path(settings: Settings | None = None) -> Path:
-    """Absolute path of the Telethon session file (without suffix)."""
+    """Absolute path of the Telethon session file (``<home>/data/sessions/<name>.session``).
+
+    This is the single resolver behind ``xtg auth login``, ``status`` and
+    ``logout``: they all go through :attr:`Settings.session_file`, so they can
+    never disagree about which file the session lives in.
+    """
     settings = settings or get_settings()
     return settings.session_file
 
@@ -103,7 +111,8 @@ def session_path(settings: Settings | None = None) -> Path:
 def session_files(settings: Settings | None = None) -> list[Path]:
     """Every file Telethon created for the configured session.
 
-    SQLite companions use both separators: ``xtg.db`` and ``xtg-journal``.
+    SQLite companions use both separators: ``xtg.session-journal`` and, in older
+    layouts, ``xtg.session.db``.
     """
     settings = settings or get_settings()
     path = settings.session_file
@@ -123,39 +132,88 @@ def describe_session(settings: Settings | None = None) -> SessionInfo:
     path = session_path(settings)
     exists = path.exists()
     journal = path.with_name(f"{path.name}-journal")
+    probe = probe_session(path)
     return SessionInfo(
         path=path,
         exists=exists,
         locked=journal.exists(),
         size_bytes=path.stat().st_size if exists else 0,
         mode=_mode_string(path) if exists else "-",
-        valid=is_session_database(path) if exists else False,
+        valid=probe.valid,
+        authorized=probe.authorized,
+        problem=probe.problem,
     )
 
 
-def is_session_database(path: Path) -> bool:
-    """True when ``path`` really is a Telethon session file.
+@dataclass(frozen=True, slots=True)
+class SessionProbe:
+    """What a local file on disk actually is.
 
-    Telethon stores the session in a SQLite database with a ``sessions`` table
-    holding the auth key. Checking that locally is cheap and keeps
-    ``xtg auth status`` honest: any other file - a stale export, a truncated
-    write, a directory - is reported as "no session" instead of pretending the
-    account is logged in.
+    Telethon 1.45 stores a session in a SQLite database carrying a ``version``
+    table and a ``sessions`` table holding ``auth_key``; being authorized means
+    that row exists with a key in it. The three flags separate "not there",
+    "there but not a session" and "a session, but nobody has logged in yet", so
+    ``xtg auth status`` can say which of those is true instead of collapsing
+    them all into "not authorized".
 
-    Never raises: a file that cannot be inspected is simply not a session.
+    The auth key is never read into this object, so it cannot leak through a
+    repr, a log or a JSON payload.
     """
+
+    valid: bool = False
+    authorized: bool = False
+    problem: str = ""
+
+
+def probe_session(path: Path) -> SessionProbe:
+    """Classify a file as a Telethon session, offline.
+
+    Handles every case that matters: missing, zero-byte, a random file, a
+    truncated or corrupted SQLite database, a SQLite file that is not a
+    Telethon session, a valid session with no auth key, and a valid authorized
+    session. Never raises - an unreadable file is simply not a session.
+    """
+    if not path.exists():
+        return SessionProbe(problem="no session file")
     if not path.is_file():
-        return False
+        return SessionProbe(problem="not a regular file")
+    if path.stat().st_size == 0:
+        return SessionProbe(problem="session file is empty")
+
     try:
-        if path.stat().st_size == 0:
-            return False
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-            row = connection.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sessions'"
-            ).fetchone()
-    except (sqlite3.Error, OSError):
-        return False
-    return bool(row and row[0])
+            # Opening is not enough: sqlite happily treats an arbitrary file as
+            # a database and only fails on the first real statement.
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if not tables >= _REQUIRED_TABLES:
+                return SessionProbe(problem="not a Telegram session database")
+            authorized = (
+                connection.execute(
+                    "SELECT count(*) FROM sessions WHERE auth_key IS NOT NULL"
+                ).fetchone()[0]
+                > 0
+            )
+    except sqlite3.DatabaseError:
+        return SessionProbe(problem="not a readable SQLite database")
+    except OSError:
+        return SessionProbe(problem="session file is not readable")
+
+    return SessionProbe(valid=True, authorized=authorized)
+
+
+#: Both tables exist in every SQLite session Telethon has written, and neither
+#: is optional: ``version`` carries the schema revision and ``sessions`` the
+#: auth key. Requiring both rejects a valid-but-unrelated SQLite file.
+_REQUIRED_TABLES = frozenset({"version", "sessions"})
+
+
+def is_session_database(path: Path) -> bool:
+    """True when ``path`` really is a Telethon session file."""
+    return probe_session(path).valid
 
 
 def auth_state(settings: Settings | None = None) -> AuthState:
