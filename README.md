@@ -270,6 +270,13 @@ compatibility, so an existing `xtg/proxy/list_proxy.json` is picked up
 automatically. `sources.json` remembers named subscription URLs so a refresh
 does not have to be retyped.
 
+Subscription files are parsed as one proxy per line. A line that is itself an
+`http(s)://` URL **with a path** is treated as a nested subscription manifest
+(Hiddify profile files list other subscription URLs) and is followed
+recursively, so a single `xtg proxy global source refresh` pulls every proxy
+from a profile tree instead of storing the manifest URLs as proxies. A bare
+`https://user:pass@host:port` with no path is a proxy endpoint and is kept.
+
 The list file (`xtg/proxy/list_proxy.json` by default, or `XTG_PROXY_FILE`)
 accepts:
 
