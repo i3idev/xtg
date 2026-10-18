@@ -24,14 +24,16 @@ __all__ = [
     "SavedItem",
     "SourceConnector",
     "SourceReport",
+    "SOURCE_DOCS",
     "available_sources",
     "get_source",
+    "get_source_docs",
 ]
 
 
 def __getattr__(name: str) -> Any:
     """Expose the registry lazily (see :mod:`xtg.sources.registry`)."""
-    if name in {"get_source", "available_sources"}:
+    if name in {"get_source", "available_sources", "get_source_docs", "SOURCE_DOCS"}:
         from xtg.sources import registry
 
         return getattr(registry, name)
