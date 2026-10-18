@@ -95,3 +95,79 @@ def test_check_many_preserves_order() -> None:
 def test_from_settings_disabled(settings) -> None:
     assert ProxyManager.from_settings(settings).enabled is False
     assert len(ProxyManager.from_settings(settings)) == 0
+
+
+def test_remove_range(tmp_path: Path) -> None:
+    from xtg.proxy.core.manager import GlobalProxyManager
+
+    manager = GlobalProxyManager(state_dir=tmp_path / "proxy", pool={})
+    for pid, uri in [
+        ("P1", "socks5://1.1.1.1:1080"),
+        ("P10", "socks5://1.1.1.1:1081"),
+        ("P100", "socks5://1.1.1.1:1082"),
+        ("P456", "socks5://1.1.1.1:1083"),
+        ("P999", "socks5://1.1.1.1:1084"),
+    ]:
+        manager.add_proxy(pid, uri)
+
+    removed = manager.remove_range("P1", "P456")
+    assert removed == ["P1", "P10", "P100", "P456"]
+    assert set(manager.get_pool()) == {"P999"}
+
+    # An empty range is a no-op, not an error.
+    assert manager.remove_range("P999", "P1") == []
+
+
+def test_sources_manager_add_list_remove(tmp_path: Path) -> None:
+    from xtg.proxy.sources.manager import SourcesManager
+
+    mgr = SourcesManager(tmp_path / "proxy")
+    assert mgr.sources == {}
+    assert mgr.names() == []
+
+    mgr.add("a", "https://x.com")
+    mgr.add("b", "https://y.com")
+    assert mgr.sources == {"a": "https://x.com", "b": "https://y.com"}
+    assert mgr.names() == ["a", "b"]
+    assert mgr.get("a") == "https://x.com"
+    assert mgr.get("missing") is None
+
+    # Overwriting an existing name is allowed.
+    mgr.add("a", "https://z.com")
+    assert mgr.get("a") == "https://z.com"
+
+    # Persistence: a second manager reading the same dir sees the sources.
+    reloaded = SourcesManager(tmp_path / "proxy")
+    assert reloaded.sources == {"a": "https://z.com", "b": "https://y.com"}
+
+    assert mgr.remove("a") is True
+    assert mgr.get("a") is None
+    assert mgr.remove("a") is False  # already gone
+
+    assert mgr.clear() == 1
+    assert mgr.sources == {}
+
+
+def test_sources_manager_rejects_empty_values(tmp_path: Path) -> None:
+    from xtg.core.errors import ProxyError
+    from xtg.proxy.sources.manager import SourcesManager
+
+    mgr = SourcesManager(tmp_path / "proxy")
+    with pytest.raises(ProxyError):
+        mgr.add("", "https://x.com")
+    with pytest.raises(ProxyError):
+        mgr.add("x", "")
+    assert mgr.sources == {}
+
+
+def test_sources_manager_survives_corrupt_file(tmp_path: Path) -> None:
+    from xtg.proxy.sources.manager import SourcesManager
+
+    state_dir = tmp_path / "proxy"
+    state_dir.mkdir()
+    (state_dir / SourcesManager.SOURCES_FILE_NAME).write_text("not json")
+    mgr = SourcesManager(state_dir)
+    assert mgr.sources == {}
+    # And it can be written again after the corruption.
+    mgr.add("a", "https://x.com")
+    assert SourcesManager(state_dir).sources == {"a": "https://x.com"}

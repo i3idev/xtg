@@ -23,13 +23,16 @@ The repository is at the end of **Phase 3**:
 | Logging (stderr + rotating file) | done |
 | SQLite schema (11 tables, SQLAlchemy 2.0) | done |
 | Proxy subsystem (load, parse, check, rotate) | done |
+| Global proxy pool (sing-box backed, subscription sources) | done |
 | Telethon client, proxy bridge, connection lifecycle | done |
 | `xtg auth login/logout/status` (phone, code, 2FA) | done |
 | `xtg collect` (messages, members, media metadata) | done |
+| `xtg info messages TARGET` (discussion graph, export edges) | done |
+| Export (JSON/CSV/Markdown/Obsidian) | done |
 | Source layer (`BaseSource` / `BaseCollector`) | done |
 | `xtg reddit status/collect` (PRAW, posts, comments) | done |
 | `status`, `db`, `proxy`, `info`, `search` | working against the local dataset |
-| `export`, `analyze graph`, media downloads | declared, implemented in Phase 4 |
+| `analyze graph`, media downloads | declared, implemented in Phase 4 |
 
 Not-yet-implemented commands answer with a clear message and exit code `9`
 instead of pretending to work.
@@ -225,15 +228,50 @@ xtg auth logout        # delete the local session files
 
 ### `xtg proxy`
 
+`xtg proxy` has two subsystems. The **global pool** is the single source of
+truth for every network consumer; the **legacy per-command list** still backs
+`xtg collect` / `xtg auth` / `xtg forward` when the global pool is disabled.
+
 ```bash
-xtg proxy list                 # table of the parsed list
-xtg proxy check                # availability check of every proxy
-xtg proxy check P1 P2          # only selected proxies
-xtg proxy status               # configuration + health counters
-xtg proxy show P3              # detail view (password/secret masked, use --reveal)
+# Global pool (sing-box backed, lives in ~/.config/xtg/proxy/)
+xtg proxy global status            # enabled, active proxy, pool size, --json
+xtg proxy global enable            # route Telegram through the pool
+xtg proxy global disable
+xtg proxy global list              # every proxy in the pool
+xtg proxy global add ss://...      # add a proxy (auto id, or --name P1)
+xtg proxy global remove P1         # remove one, or P1=>P456 for a range
+xtg proxy global clear             # empty the pool
+xtg proxy global use P1            # set the active proxy
+xtg proxy global test P1           # test one proxy via sing-box
+xtg proxy global test              # test every proxy
+xtg proxy global refresh <url>     # replace the pool from a subscription
+xtg proxy global source add mysub <url>   # remember a subscription URL
+xtg proxy global source list               # list remembered sources
+xtg proxy global source refresh mysub     # refresh from a remembered source
+xtg proxy global source remove mysub
+xtg proxy global source clear
+
+# Legacy per-command list (XTG_PROXY_FILE)
+xtg proxy telegram list
+xtg proxy telegram check [P1 P2]
+xtg proxy telegram show P3
 ```
 
-The list file is `xtg/proxy/list_proxy.json`:
+The global pool lives in `~/.config/xtg/proxy/`:
+
+| File | Content |
+| --- | --- |
+| `state.json` | `enabled`, `active_proxy_id`, `last_refresh`, `core` |
+| `list_proxy.json` | `{"proxys": {"P1": "uri", ...}}` |
+| `sources.json` | `{"mysub": "https://...", ...}` |
+
+On first load the pool seeds from the legacy list file for backward
+compatibility, so an existing `xtg/proxy/list_proxy.json` is picked up
+automatically. `sources.json` remembers named subscription URLs so a refresh
+does not have to be retyped.
+
+The list file (`xtg/proxy/list_proxy.json` by default, or `XTG_PROXY_FILE`)
+accepts:
 
 ```json
 {
@@ -250,12 +288,12 @@ Accepted entry formats: `socks5://host:port`, `http://host:port`,
 `tg://proxy?server=…&port=…&secret=…`. Entries without a scheme are treated as
 SOCKS5. MTProto entries keep their `server`, `port` and `secret` separately and
 the secret is masked everywhere except the canonical `url` used to write the
-list file back. Invalid entries are reported by `xtg proxy list` instead of
+list file back. Invalid entries are reported by `xtg proxy telegram list` instead of
 aborting the run.
 
-`xtg proxy check` connects with TCP for the classical schemes. MTProto proxies are
-checked by speaking their transport (`xtg/proxy/mtproto.py`, a byte-compatible
-port of Telethon's `MTProxyIO`):
+`xtg proxy telegram check` connects with TCP for the classical schemes. MTProto
+proxies are checked by speaking their transport (`xtg/proxy/mtproto.py`, a
+byte-compatible port of Telethon's `MTProxyIO`):
 
 * the 64 byte obfuscated2 initiation is sent, with AES-256-CTR keys derived as
   `sha256(header[8:40] + secret)` - the secret is part of the key schedule, so a
@@ -270,8 +308,15 @@ port of Telethon's `MTProxyIO`):
 Statuses are `alive`, `dead` (nothing listening, or the proxy hung up),
 `invalid` (cannot work as configured, e.g. a missing secret), `unsupported`
 (unknown scheme, a fake-TLS/`ee` secret, or `pycryptodome` not installed) and
-`error`. Use `xtg proxy check --json` or the per-entry detail line for the
+`error`. Use `xtg proxy telegram check --json` or the per-entry detail line for the
 protocol level reason.
+
+`xtg proxy global test` validates every pool entry through a real `sing-box`
+process: a temporary mixed inbound, the proxy as the outbound, and an HTTP
+request to `https://www.gstatic.com/generate_204`. Dead proxies report
+`alive:false` instead of aborting, and MTProto entries surface a graceful
+"Unsupported proxy type for sing-box: mtproto" because the global pool is
+outbound-only.
 
 To probe a real endpoint without touching the list file:
 
@@ -309,7 +354,14 @@ xtg search "bitcoin" --chat @channel --limit 100 --json
 xtg info chat @channel
 xtg info user @durov
 xtg info stats
+xtg info messages TARGET            # discussion graph + reply edges
 ```
+
+`xtg info messages TARGET` walks the discussion tree of a channel: it stores
+each thread root as a comment, every reply as an edge, and re-exports the graph
+in JSON, CSV, Markdown or Obsidian format. Edges are linked strictly by
+`(telegram_chat_id, telegram_message_id)` - never by timestamp, text, author or
+position - so an interrupted collection can be resumed safely.
 
 ### `xtg collect`
 
@@ -495,6 +547,9 @@ xtg/
 ├── core/           config, logging, errors/exit codes, small utilities
 ├── database/       SQLAlchemy models, engine management, query helpers
 ├── proxy/          independent proxy subsystem (parser/loader/checker/manager)
+│   ├── core/       global pool manager + sing-box runner + config builder
+│   ├── sources/    subscription fetcher and named-source manager
+│   └── manager.py  legacy per-command proxy list
 ├── sources/        platform connectors behind one contract
 │   ├── base.py     SourceReport, BaseSource, BaseCollector
 │   ├── registry.py lazy source lookup by name
@@ -580,7 +635,7 @@ other sources record their provenance as a node reference such as
 
 ```bash
 uv sync                       # once, with network
-uv run pytest                 # 281 tests
+uv run pytest                 # 720 tests
 uv run ruff check
 uv run ruff format --check
 uv run pyright                # type checking (see below)

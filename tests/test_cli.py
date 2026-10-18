@@ -141,31 +141,184 @@ def test_auth_logout_without_session(cli: Any) -> None:
     assert result.exit_code == 0
 
 
-def test_proxy_status_json(cli: Any, hermetic_proxies: Path) -> None:
-    result = runner.invoke(cli, ["proxy", "status", "--json"])
+def test_proxy_global_status_json(cli: Any, hermetic_proxies: Path) -> None:
+    """The global pool seeds from the legacy list on first load."""
+    result = runner.invoke(cli, ["proxy", "global", "status", "--json"])
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["file"] == str(hermetic_proxies)
-    assert payload["stats"]["valid"] == 3
+    assert payload["enabled"] is False
+    assert payload["active"] is None
+    assert payload["pool_size"] == 3
 
 
-def test_proxy_list(cli: Any, hermetic_proxies: Path) -> None:
-    result = runner.invoke(cli, ["proxy", "list"])
+def test_proxy_global_list(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "list"])
     assert result.exit_code == 0
     assert "P1" in result.output
     assert "socks5" in result.output
 
 
-def test_proxy_show_masks_password(cli: Any, hermetic_proxies: Path) -> None:
-    result = runner.invoke(cli, ["proxy", "show", "P3"])
+def test_proxy_global_remove_single(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "remove", "P2"])
     assert result.exit_code == 0
-    assert "password" in result.output
-    assert "***" in result.output or "**" in result.output
+    assert "Removed proxy P2" in result.output
+    payload = json.loads(runner.invoke(cli, ["proxy", "global", "status", "--json"]).stdout)
+    assert payload["pool_size"] == 2
+    assert "P2" not in payload["proxies"]
 
 
-def test_proxy_show_unknown_name(cli: Any, hermetic_proxies: Path) -> None:
-    result = runner.invoke(cli, ["proxy", "show", "NOPE"])
-    assert result.exit_code == 7
+def test_proxy_global_remove_range(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "remove", "P1=>P2"])
+    assert result.exit_code == 0
+    assert "Removed 2 proxies in range P1=>P2" in result.output
+    payload = json.loads(runner.invoke(cli, ["proxy", "global", "status", "--json"]).stdout)
+    assert payload["pool_size"] == 1
+    assert "P3" in payload["proxies"]
+    assert "P1" not in payload["proxies"]
+    assert "P2" not in payload["proxies"]
+
+
+def test_proxy_global_remove_unknown(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "remove", "P99"])
+    assert result.exit_code == 0
+    assert "not found" in result.output
+
+
+def test_proxy_global_remove_empty_range(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "remove", "P99=>P100"])
+    assert result.exit_code == 0
+    assert "No proxies in range" in result.output
+
+
+def test_proxy_global_add_then_remove(cli: Any, hermetic_proxies: Path) -> None:
+    """Seed the global pool, then exercise single + range removal."""
+    # Use IDs that don't collide with the hermetic P1/P2/P3.
+    assert (
+        runner.invoke(
+            cli, ["proxy", "global", "add", "socks5://1.1.1.1:1080", "--name", "Q1"]
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            cli, ["proxy", "global", "add", "http://2.2.2.2:8080", "--name", "Q2"]
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            cli, ["proxy", "global", "add", "http://3.3.3.3:8080", "--name", "Q3"]
+        ).exit_code
+        == 0
+    )
+
+    payload = json.loads(runner.invoke(cli, ["proxy", "global", "status", "--json"]).stdout)
+    assert payload["pool_size"] == 6
+
+    result = runner.invoke(cli, ["proxy", "global", "remove", "Q1=>Q2"])
+    assert result.exit_code == 0
+    assert "Removed 2 proxies in range Q1=>Q2" in result.output
+    payload = json.loads(runner.invoke(cli, ["proxy", "global", "status", "--json"]).stdout)
+    assert payload["pool_size"] == 4
+    assert "Q3" in payload["proxies"]
+    assert "Q1" not in payload["proxies"]
+    assert "Q2" not in payload["proxies"]
+
+
+def test_proxy_telegram_list(cli: Any, hermetic_proxies: Path) -> None:
+    """The legacy per-command list still lists the hermetic 3 entries."""
+    result = runner.invoke(cli, ["proxy", "telegram", "list"])
+    assert result.exit_code == 0
+    assert "P1" in result.output
+    assert "socks5" in result.output
+
+
+def test_proxy_source_list_empty(cli: Any, hermetic_proxies: Path) -> None:
+    """A fresh global pool has no subscription sources."""
+    result = runner.invoke(cli, ["proxy", "global", "source", "list"])
+    assert result.exit_code == 0
+    assert "No subscription sources" in result.output
+
+
+def test_proxy_source_list_json_empty(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "source", "list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["sources"] == {}
+    assert payload["count"] == 0
+
+
+def test_proxy_source_add_list_remove(cli: Any, hermetic_proxies: Path) -> None:
+    assert (
+        runner.invoke(cli, ["proxy", "global", "source", "add", "a", "https://x.com"]).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(cli, ["proxy", "global", "source", "add", "b", "https://y.com"]).exit_code
+        == 0
+    )
+
+    result = runner.invoke(cli, ["proxy", "global", "source", "list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 2
+    assert payload["sources"] == {"a": "https://x.com", "b": "https://y.com"}
+
+    assert runner.invoke(cli, ["proxy", "global", "source", "remove", "a"]).exit_code == 0
+    result = runner.invoke(cli, ["proxy", "global", "source", "list", "--json"])
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert "a" not in payload["sources"]
+    assert "b" in payload["sources"]
+
+    # Removing something that does not exist is not an error.
+    assert runner.invoke(cli, ["proxy", "global", "source", "remove", "nope"]).exit_code == 0
+    assert "not found" in runner.invoke(cli, ["proxy", "global", "source", "remove", "nope"]).output
+
+
+def test_proxy_source_clear(cli: Any, hermetic_proxies: Path) -> None:
+    for name, url in (("a", "https://x.com"), ("b", "https://y.com")):
+        assert runner.invoke(cli, ["proxy", "global", "source", "add", name, url]).exit_code == 0
+    assert runner.invoke(cli, ["proxy", "global", "source", "clear"]).exit_code == 0
+    result = runner.invoke(cli, ["proxy", "global", "source", "list", "--json"])
+    assert json.loads(result.stdout)["count"] == 0
+
+
+def test_proxy_source_persists_across_invocations(
+    cli: Any, hermetic_proxies: Path, isolated_home: Path
+) -> None:
+    """Sources survive a second process invocation."""
+    assert (
+        runner.invoke(cli, ["proxy", "global", "source", "add", "s1", "https://x.com"]).exit_code
+        == 0
+    )
+    result = runner.invoke(cli, ["proxy", "global", "source", "list", "--json"])
+    assert json.loads(result.stdout)["sources"] == {"s1": "https://x.com"}
+    sources_file = isolated_home / ".config" / "xtg" / "proxy" / "sources.json"
+    assert sources_file.exists()
+    assert "https://x.com" in sources_file.read_text()
+
+
+def test_proxy_source_add_empty_name_rejected(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "source", "add", "", "https://x.com"])
+    assert result.exit_code != 0
+
+
+def test_proxy_source_add_empty_url_rejected(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "source", "add", "x", ""])
+    assert result.exit_code != 0
+
+
+def test_proxy_source_refresh_unknown_exits_not_found(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "source", "refresh", "nope", "--no-test"])
+    assert result.exit_code == 8
+
+
+def test_proxy_source_help_lists_subcommands(cli: Any, hermetic_proxies: Path) -> None:
+    result = runner.invoke(cli, ["proxy", "global", "source", "--help"])
+    assert result.exit_code == 0
+    for sub in ("list", "add", "remove", "refresh", "clear"):
+        assert sub in result.output
 
 
 def test_export_formats(cli: Any) -> None:
@@ -173,7 +326,8 @@ def test_export_formats(cli: Any) -> None:
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["known"] == ["json", "csv", "markdown", "obsidian"]
-    assert payload["implemented"] == []
+    # Every declared format has a writer behind it.
+    assert payload["implemented"] == ["csv", "json", "markdown", "obsidian"]
 
 
 def test_export_without_data_exits_not_found(cli: Any) -> None:
